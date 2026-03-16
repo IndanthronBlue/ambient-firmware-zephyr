@@ -1,0 +1,88 @@
+/* Board-specific overlay to enable SAI1 Block B and correct audio PLL setup */
+
+/ {
+	aliases {
+		rtc = &rtc;
+	};
+
+	chosen {
+		zephyr,console = &usart2;
+		zephyr,shell-uart = &usart2;
+	};
+};
+
+/* Audio PLL retuned for ~16 kHz SAI master mode:
+ * HSI (16 MHz) feeds PLLSAI1 with M=1, N=18 so VCO=288 MHz.
+ * P divider of 5 gives a 57.6 MHz SAI kernel clock, which lands on 16 kHz
+ * after the STM32 SAI master clock divider computes MCKDIV=7.
+ * Q/R stay available at 48 MHz via divisor 6 for other peripherals.
+ */
+
+
+&pllsai1 {
+	div-m = <1>;
+	mul-n = <18>;
+	div-p = <5>;
+	div-q = <6>;
+	div-r = <6>;
+	clocks = <&clk_hsi>;
+	status = "okay";
+};
+
+&sai1_b {
+	pinctrl-0 = <&sai1_mclk_b_pb4 &sai1_sd_b_pb5 &sai1_fs_b_pb6 &sai1_sck_b_pb3>;
+	pinctrl-names = "default";
+	mclk-enable;
+	mclk-divider = "div-256";
+	dma-names = "rx";
+	status = "okay";
+};
+
+
+&v_periph {
+	startup-delay-us = <200000>; /* 200 ms */
+};
+
+&usart1 {
+	status = "disabled";
+};
+
+&usart2 {
+	/* ST-Link VCP debug: PA2(TX), PA3(RX) */
+	pinctrl-0 = <&usart2_tx_pa2 &usart2_rx_pa3>;
+	pinctrl-names = "default";
+	current-speed = <115200>;
+	status = "okay";
+};
+
+&zephyr_udc0 {
+	status = "disabled";
+};
+
+&i2c2 {
+	clock-frequency = <100000>;
+};
+
+&ina3221 {
+	/* Match ambient_firmware.ino:
+	 * ch1 (solar): 0.075 ohm (2x 0.150 ohm in parallel) => 75 mOhm
+	 * ch2 (battery): 0.150 ohm => 150 mOhm
+	 */
+	shunt-resistors = <75 150 0>;
+	enable-channel = <1 1 0>;
+	zephyr,deferred-init;
+};
+
+&dma2 {
+	status = "okay";
+};
+
+&iwdg {
+	status = "okay";
+};
+
+&i2c1 {
+	/* Lower bitrate for more robust GNSS NMEA-over-I2C */
+	clock-frequency = <100000>;
+	status = "okay";
+};

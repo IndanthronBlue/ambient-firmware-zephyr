@@ -1,0 +1,66 @@
+/*
+ * Global Application State
+ * Shared by all tasks
+ */
+
+#include "tasks.h"
+
+/* Global application state instance */
+app_state_t app_state = {
+	.button_press_count = 0,
+	.led_state = false,
+	.last_solar_mv = 0,
+	.last_battery_mv = 0,
+	.last_temp_celsius = 0.0f,
+	.last_press_kpa = 0.0f,
+	.last_humidity_percent = 0.0f,
+	.voltage_read_count = 0,
+	.sensor_read_count = 0,
+	.ina_ch1_voltage_v = 0.0f,
+	.ina_ch2_voltage_v = 0.0f,
+	.ina_ch3_voltage_v = 0.0f,
+	.ina_ch1_current_ma = 0.0f,
+	.ina_ch2_current_ma = 0.0f,
+	.ina_ch3_current_ma = 0.0f,
+	.ina_read_count = 0,
+	.sd_mounted = false,
+	.sd_listed_once = false,
+	.sd_capacity_valid = false,
+	.sd_total_mib = 0,
+	.sd_free_mib = 0,
+	.mic_recording = false,
+	.mic_record_request = false,
+	.lorawan_joined = false,
+	.lorawan_join_attempts = 0,
+	.lorawan_uplink_count = 0,
+	.lorawan_last_error = 0,
+	.gps_valid = false,
+	.gps_latitude = 0.0f,
+	.gps_longitude = 0.0f,
+	.gps_fix_count = 0
+	,
+	.infer_last_label = -1,
+	.infer_total_count = 0,
+	.infer_last_rms = 0.0f,
+	.infer_avg_rms = 0.0f,
+	.infer_labels_window = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+	.infer_labels_uplink = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+	.infer_total_count_uplink = 0,
+	.infer_window_count = 0,
+	.infer_window_ready = false,
+	.infer_mfcc_chunk_ms = {0, 0, 0, 0, 0, 0},
+	.infer_mfcc_series_ms = 0,
+	.infer_detector_ms = 0,
+	.infer_classifier_ms = 0,
+	.infer_capture_to_done_ms = 0,
+	.infer_session_id_done = 0,
+	.sdon = 0,
+	.sd_usage_percent = 0,
+	.sd_pcm_write_enabled = false,
+	.sd_pcm_blocks = 0,
+	.sd_pcm_total_bytes = 0,
+	.sd_pcm_total_ms = 0,
+	.sd_pcm_max_ms = 0,
+	.sd_pcm_avg_ms = 0,
+	.sd_pcm_last_block_ms = 0
+};
