@@ -32,8 +32,8 @@ static const struct device *gps_i2c = DEVICE_DT_GET(DT_NODELABEL(i2c1));
 #endif
 
 /* GPS main and backup power from board DTS gpio_keys labels */
-static const struct gpio_dt_spec gps_en = GPIO_DT_SPEC_GET(DT_NODELABEL(gps_main_power), gpios);
-static const struct gpio_dt_spec gps_backup = GPIO_DT_SPEC_GET(DT_NODELABEL(gps_backup_power), gpios);
+static const struct gpio_dt_spec gps_en = GPIO_DT_SPEC_GET(DT_NODELABEL(gps_on_off), gpios);
+static const struct gpio_dt_spec gps_backup = GPIO_DT_SPEC_GET(DT_NODELABEL(gps_vbckp), gpios);
 
 /* Internal state */
 static bool initialized = false;
@@ -86,7 +86,14 @@ static int gps_power_on(void)
      * breaks audio capture (RX all zeros).
      */
     if (gps_backup.port) {
-        LOG_WRN("GPS backup power GPIO skipped to avoid SAI1_B FS pin conflict");
+        ret = gpio_pin_configure_dt(&gps_backup, GPIO_OUTPUT);
+        if (ret) {
+            LOG_ERR("gps_backup configure failed: %d", ret);
+            return ret;
+        }
+        /* Ensure low, then high */
+        gpio_pin_set_dt(&gps_backup, 1);
+        LOG_INF("GPS backup power enabled (PA6)");
     }
     /* 2) Enable main power (PB11) */
     if (gps_en.port) {
