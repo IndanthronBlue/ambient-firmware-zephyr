@@ -1,0 +1,381 @@
+/*
+ * Copyright (c) 2017 Linaro Limited
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/dts-v1/;
+#include <st/u5/stm32u595.dtsi>
+#include <st/u5/stm32u595ritx-pinctrl.dtsi>
+#include "arduino_r3_connector.dtsi"
+#include <zephyr/dt-bindings/input/input-event-codes.h>
+#include <zephyr/dt-bindings/lora/sx126x.h>
+
+/ {
+	model = "LEAT STM32U5-BIRD board";
+	compatible = "leat,stm32u5-bird";
+
+	chosen {
+		zephyr,console = &usart2;
+		zephyr,shell-uart = &usart2;
+		//zephyr,console = &cdc_acm_uart0;
+		//zephyr,shell-uart = &cdc_acm_uart0;
+		zephyr,sram = &sram0;
+		zephyr,flash = &flash0;
+		//zephyr,flash-controller = &mx25r6435;
+	};
+	
+	/* Custom pinctrl for SPI1 MISO with pull-up */
+	soc {
+		pinctrl: pin-controller@42020000 {
+			spi1_miso_pb4_pullup: spi1_miso_pb4_pullup {
+				pinmux = <STM32_PINMUX('B', 4, AF5)>;
+				bias-pull-up;
+			};
+			spi3_miso_pc11_pullup: spi3_miso_pc11_pullup {
+				pinmux = <STM32_PINMUX('C', 11, AF6)>;
+				bias-pull-up;
+			};
+		};
+	};
+	
+
+	leds {
+		compatible = "gpio-leds";
+
+		led: led {
+			gpios = <&gpioc 8 GPIO_ACTIVE_HIGH>;
+			label = "LED";
+		};
+	};
+
+	gpio_keys {
+		compatible = "gpio-keys";
+		user_button: button {
+			label = "User";
+			gpios = <&gpioc 5 GPIO_ACTIVE_LOW>;
+		};
+		hall: hall {
+			label = "Hall";
+			gpios = <&gpioa 7 GPIO_ACTIVE_LOW>;
+		};
+		gps_init: gps_init {
+			gpios = <&gpiob 10 GPIO_ACTIVE_HIGH>;
+			label = "GPS INIT";
+		};
+		gps_vbckp: gps_vbckp {
+			gpios = <&gpioa 6 GPIO_ACTIVE_HIGH>;
+			label = "GPS V_BCKP ON OFF";
+		};
+		gps_on_off: gps_on_off {
+			gpios = <&gpioc 6 GPIO_ACTIVE_HIGH>;
+			label = "GPS ON OFF";
+		};
+	};
+
+	vbatt {
+		compatible = "voltage-divider";
+		io-channels = <&adc4 4>;
+		output-ohms = <2000000>;
+		full-ohms = <(1000000 + 2000000)>;
+	};
+
+	solar {
+		compatible = "voltage-divider";
+		io-channels = <&adc2 3>;
+		output-ohms = <1000000>;
+		full-ohms = <(4000000 + 1000000)>;
+	};
+
+	v_periph: v-periph-ctrl {
+		compatible = "regulator-fixed";
+		regulator-name = "v-periph";
+		enable-gpios = <&gpioc 13 GPIO_ACTIVE_HIGH>;
+		startup-delay-us = <2500>;
+		regulator-boot-on;
+	};
+
+	aliases {
+		led0 = &led;
+		sw0 = &user_button;
+		hall0 = &hall;
+		mcuboot-led0 = &led;
+		mcuboot-button0 = &user_button;
+		gps-init = &gps_init;
+		gps-vbckp = &gps_vbckp;
+	};
+};
+
+
+&clk_hsi48 {
+	status = "okay";
+};
+
+&clk_hsi {
+	status = "okay";
+};
+
+&clk_hse {
+	clock-frequency = <DT_FREQ_M(16)>;
+	status = "okay";
+};
+
+
+&clk_lse {
+	status = "okay";
+};
+
+
+&pll1 {
+	div-m = <4>;
+	mul-n = <80>;
+	div-p = <2>;
+	div-q = <2>;
+	div-r = <2>;
+	clocks = <&clk_hse>;
+	status = "okay";
+};
+
+&pll2 {
+	div-m = <4>;
+	mul-n = <66>;
+	div-p = <2>;
+	div-q = <2>;
+	div-r = <2>;
+	clocks = <&clk_hse>;
+	status = "okay";
+};
+
+&pll3 {
+	div-m = <4>;
+	mul-n = <125>;
+	div-p = <20>;
+	div-q = <20>;
+	div-r = <20>;
+	clocks = <&clk_hse>;
+	status = "okay";
+};
+
+&rcc {
+	clocks = <&pll1>;
+	clock-frequency = <DT_FREQ_M(160)>;
+	ahb-prescaler = <1>;
+	apb1-prescaler = <1>;
+	apb2-prescaler = <1>;
+	apb3-prescaler = <1>;
+};
+
+&usart1 {
+	pinctrl-0 = <&usart1_tx_pb6 &usart1_rx_pa10>;
+	pinctrl-names = "default";
+	current-speed = <115200>;
+	status = "okay";
+};
+
+&usart2 {
+	pinctrl-0 = <&usart2_tx_pa2 &usart2_rx_pa3>;
+	pinctrl-names = "default";
+	current-speed = <115200>;
+	status = "okay";
+};
+
+
+&timers2 {
+	status = "okay";
+	st,prescaler = <0>;
+
+	pwm2: pwm {
+		status = "okay";
+		pinctrl-0 = <&tim2_ch1_pa0>;
+		pinctrl-names = "default";
+	};
+};
+
+&i2c1 {
+	pinctrl-0 = <&i2c1_scl_pb8 &i2c1_sda_pb9>;
+	pinctrl-names = "default";
+	scl-gpios = <&gpiob 8 (GPIO_OPEN_DRAIN | GPIO_ACTIVE_HIGH)>;
+    sda-gpios = <&gpiob 9 (GPIO_OPEN_DRAIN | GPIO_ACTIVE_HIGH)>;
+	status = "okay";
+	clock-frequency = <I2C_BITRATE_STANDARD>;
+
+	bme280: bme280@76 {
+		compatible = "bosch,bme280";
+		status = "okay";
+		reg = <0x76>;
+		vin-supply = <&v_periph>;
+	};
+
+	cam_m8q: gps@10 {
+        compatible = "u-blox,neo-m8"; 
+        reg = <0x10>;
+        status = "okay";
+    };
+};
+
+&flash0{
+	reg = <0x08000000 DT_SIZE_M(2)>;
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/* MCUboot 引导程序占用 64KB */
+		boot_partition: partition@0 {
+			label = "mcuboot";
+			reg = <0x00000000 0x00010000>;
+		};
+		/* 主程序插槽 Slot 0：928KB */
+		slot0_partition: partition@10000 {
+			label = "image-0";
+			reg = <0x00010000 0x000E8000>;
+		};
+		/* 备用程序插槽 Slot 1：928KB */
+		slot1_partition: partition@f8000 {
+			label = "image-1";
+			reg = <0x000F8000 0x000E8000>;
+		};
+		/* 交换区 Scratch：64KB (MCUboot交换固件时需要) */
+		scratch_partition: partition@1e0000 {
+			label = "image-scratch";
+			reg = <0x001E0000 0x00010000>;
+		};
+		/* 剩余 64KB 用于用户数据存储 (可选) */
+		storage_partition: partition@1f0000 {
+			label = "storage";
+			reg = <0x001F0000 0x00010000>;
+		};
+	};
+};
+
+&i2c2 {
+	pinctrl-0 = <&i2c2_scl_pb13 &i2c2_sda_pb14>;
+	pinctrl-names = "default";
+	clock-frequency = <I2C_BITRATE_STANDARD>;
+	scl-gpios = <&gpiob 13 (GPIO_OPEN_DRAIN | GPIO_PULL_UP)>;
+	sda-gpios = <&gpiob 14 (GPIO_OPEN_DRAIN | GPIO_PULL_UP)>;
+	status = "okay";
+
+	ina3221: ina3221@40 {
+		compatible = "ti,ina3221";
+		reg = <0x40>;
+		shunt-resistors = <150 150 0>;
+		enable-channel = <1 1 0>;
+		conv-time-bus = <7>;
+		conv-time-shunt = <7>;
+		avg-mode = <2>;
+		vin-supply = <&v_periph>;
+		status = "okay";
+	};
+};
+
+&spi3 {
+	pinctrl-0 = <&spi3_sck_pc10 &spi3_miso_pc11_pullup &spi3_mosi_pc12>;
+	cs-gpios = <&gpioc 0 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>,
+	           <&gpiod 2 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	lora: sx1262@0 {
+		compatible = "semtech,sx1262";
+		reg = <0>;
+		label = "sx1262";
+		reset-gpios = <&gpioa 4 GPIO_ACTIVE_LOW>;
+		busy-gpios = <&gpiob 12 GPIO_ACTIVE_HIGH>;
+		rx-enable-gpios = <&gpioc 4 GPIO_ACTIVE_LOW>;
+		dio1-gpios = <&gpioc 7 GPIO_ACTIVE_HIGH>;
+		dio2-tx-enable;
+		dio3-tcxo-voltage = <SX126X_DIO3_TCXO_3V3>;
+		tcxo-power-startup-delay-ms = <5>;
+		spi-max-frequency = <1000000>;
+		vin-supply = <&v_periph>;
+	};
+
+	sdhc0: sdhc@1 {
+		compatible = "zephyr,sdhc-spi-slot";
+		reg = <1>;
+		status = "okay";
+		/* Conservative SPI frequency to ensure reliable initialization */
+		spi-max-frequency = <8000000>;
+		/* Power delay for SD card initialization */
+		power-delay-ms = <1500>;
+		vin-supply = <&v_periph>;
+		mmc {
+			compatible = "zephyr,sdmmc-disk";
+			disk-name = "SD";
+			status = "okay";
+		};
+	};
+};
+
+
+&rtc {
+	clocks = <&rcc STM32_CLOCK(APB3, 21)>,
+		 <&rcc STM32_SRC_LSE RTC_SEL(1)>;
+	status = "okay";
+};
+
+&sdmmc1 {
+	pinctrl-0 = <&sdmmc1_d0_pc8 &sdmmc1_d1_pc9
+		     &sdmmc1_d2_pc10 &sdmmc1_d3_pc11
+		     &sdmmc1_ck_pc12 &sdmmc1_cmd_pd2>;
+	pinctrl-names = "default";
+	disk-name = "SD";
+	status = "disabled";
+};
+
+&adc1 {
+	pinctrl-0 = <&adc1_in10_pa5>;
+	pinctrl-names = "default";
+	st,adc-clock-source = "ASYNC";
+	st,adc-prescaler = <4>;
+	status = "okay";
+};
+
+&adc2 {
+	pinctrl-0 = <&adc2_in3_pc2>;
+	pinctrl-names = "default";
+	st,adc-clock-source = "ASYNC";
+	st,adc-prescaler = <4>;
+	status = "okay";
+};
+
+&adc4 {
+	pinctrl-0 = <&adc4_in4_pc3>;
+	pinctrl-names = "default";
+	st,adc-clock-source = "ASYNC";
+	st,adc-prescaler = <4>;
+	st,adc-resolutions = <12 10 8 6>;
+	sampling-times = <3 7 13 25 48 93 248 641>;
+	st,adc-sequencer = "programmable";
+	status = "okay";
+};
+
+&gpdma1 {
+	status = "okay";
+};
+
+zephyr_udc0: &usbotg_hs {
+	pinctrl-0 = <&usb_otg_hs_dm_pa11 &usb_otg_hs_dp_pa12>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+&otghs_phy {
+	clock-reference = "SYSCFG_OTG_HS_PHY_CLK_16MHz";
+	status = "okay";
+};
+
+&zephyr_udc0 {
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};
+
+&vref1 {
+	status = "okay";
+};
+
+&vbat1 {
+	status = "okay";
+};

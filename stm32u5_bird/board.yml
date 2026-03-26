@@ -1,0 +1,6 @@
+board:
+  name: stm32u5_bird
+  full_name: STM32U5 EZBird
+  vendor: leat
+  socs:
+    - name: stm32u595xx

@@ -1,0 +1,75 @@
+/* Board-specific overlay to enable SAI1 Block B and correct audio PLL setup */
+
+/ {
+	aliases {
+		rtc = &rtc;
+	};
+
+	chosen {
+		zephyr,console = &usart2;
+		zephyr,shell-uart = &usart2;
+		zephyr,code-partition = &slot0_partition;
+	};
+};
+
+&sai1_b {
+	pinctrl-0 = <&sai1_mclk_b_pb4 &sai1_sd_b_pb5 &sai1_fs_b_pb6 &sai1_sck_b_pb3>;
+	pinctrl-names = "default";
+	mclk-enable;
+	mclk-divider = "div-256";
+	dma-names = "rx";
+	status = "okay";
+};
+
+&v_periph {
+	startup-delay-us = <200000>; /* 200 ms */
+};
+
+&i2c2 {
+	clock-frequency = <100000>;
+};
+
+&i2c1 {
+	clock-frequency = <100000>;
+};
+
+&ina3221 {
+	/* Match ambient_firmware.ino:
+	 * ch1 (solar): 0.075 ohm (2x 0.150 ohm in parallel) => 75 mOhm
+	 * ch2 (battery): 0.150 ohm => 150 mOhm
+	 */
+	shunt-resistors = <75 150 0>;
+	enable-channel = <1 1 0>;
+	zephyr,deferred-init;
+};
+
+&iwdg {
+	status = "okay";
+};
+
+&i2c1 {
+	/* Lower bitrate for more robust GNSS NMEA-over-I2C */
+	clock-frequency = <100000>;
+	kxtj3: kxtj3@f {
+		compatible = "kionix,kxtj3-1057";
+		reg = <0x0f>;
+		status = "okay";
+	};
+	status = "okay";
+};
+
+&spi3 {
+	clocks = <&rcc STM32_CLOCK(APB3, 5)>,
+		 <&rcc STM32_SRC_HSI16 SPI3_SEL(2)>;
+};
+
+&pll2 {
+    div-m = <4>;
+    mul-n = <65>;
+    fracn = <4391>;
+    div-p = <2>;
+    div-q = <2>;
+    div-r = <2>;
+    clocks = <&clk_hse>;
+    status = "okay";
+};

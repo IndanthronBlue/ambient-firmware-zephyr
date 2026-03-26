@@ -1,0 +1,22 @@
+identifier: stm32u595_bird
+name: ST STM32U595 EZBird
+type: mcu
+arch: arm
+toolchain:
+  - zephyr
+  - gnuarmemb
+  - xtools
+ram: 2536
+flash: 2048
+supported:
+  - arduino_i2c
+  - pwm
+  - i2c
+  - spi
+  - gpio
+  - counter
+  - adc
+  - qspi
+  - watchdog
+  - dma
+vendor: leat
