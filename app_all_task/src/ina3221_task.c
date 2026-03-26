@@ -43,7 +43,7 @@ static int init_ina3221(void)
         } else {
             LOG_INF("I2C2 scan start (7-bit addresses):");
             int found = 0;
-            for (uint8_t addr = 0x03; addr <= 0x77; addr++) {
+            for (uint8_t addr = 0x01; addr <= 0x80; addr++) {
                 int ret = i2c_write_read(i2c2_dev, addr, NULL, 0, NULL, 0);
                 if (ret == 0) {
                     found++;
