@@ -24,7 +24,38 @@ LOG_MODULE_REGISTER(inference_task, LOG_LEVEL_INF);
 
 #include "tab_filt.h" /* dctMatrixFilters, filtPos, filtLen, packedFilters, window */
 #include "bird_detect_mfcc_model_floating.h" /* cnn_detect(), input_t, dense_1_output_type */
+
+int32_t scale_number_t_int16_t(int32_t number, int scale_factor, round_mode_t round_mode);
+int16_t scale_and_clamp_to_number_t_int16_t(int32_t number, int scale_factor, round_mode_t round_mode);
+
 #include "ezbirdetect.h" /* Multiclass classifier cnn() and classifier_output_type */
+
+int32_t scale_number_t_int16_t(int32_t number, int scale_factor, round_mode_t round_mode)
+{
+    if (scale_factor <= 0) {
+        return number << (-scale_factor);
+    }
+
+    if (round_mode == ROUND_MODE_NEAREST) {
+        number += (1 << (scale_factor - 1));
+    }
+
+    return number >> scale_factor;
+}
+
+int16_t scale_and_clamp_to_number_t_int16_t(int32_t number, int scale_factor, round_mode_t round_mode)
+{
+    int32_t scaled = scale_number_t_int16_t(number, scale_factor, round_mode);
+
+    if (scaled > INT16_MAX) {
+        return INT16_MAX;
+    }
+    if (scaled < INT16_MIN) {
+        return INT16_MIN;
+    }
+
+    return (int16_t)scaled;
+}
 
 /* ===== Pipeline configuration ===== */
 #define NB_COEF_MFCC           (MODEL_INPUT_DIM_1 + 1) /* MFCC outputs include C0; model uses 9 coeffs skipping C0 */
@@ -98,6 +129,16 @@ static volatile uint32_t infer_done_session_id = 0U;
 #define INFER_BKP_LABELS1            LL_RTC_BKP_DR5
 #define INFER_BKP_LABELS2            LL_RTC_BKP_DR6
 
+#if defined(CONFIG_SOC_SERIES_STM32U5X)
+#define INFER_RTC_SET_REG(rtc, reg, val) LL_RTC_BKP_SetRegister((rtc), (reg), (val))
+#define INFER_RTC_GET_REG(rtc, reg)      LL_RTC_BKP_GetRegister((rtc), (reg))
+#elif defined(CONFIG_SOC_SERIES_STM32L4X)
+#define INFER_RTC_SET_REG(rtc, reg, val) LL_RTC_BAK_SetRegister((rtc), (reg), (val))
+#define INFER_RTC_GET_REG(rtc, reg)      LL_RTC_BAK_GetRegister((rtc), (reg))
+#else
+#error "Unsupported STM32 series for RTC backup register API"
+#endif
+
 static void infer_persist_state(void)
 {
 	uint32_t labels_reg0 = 0U;
@@ -115,21 +156,21 @@ static void infer_persist_state(void)
 	}
 
 	LL_PWR_EnableBkUpAccess();
-	LL_RTC_BAK_SetRegister(RTC, INFER_BKP_TOTAL, app_state.infer_total_count);
-	LL_RTC_BAK_SetRegister(RTC, INFER_BKP_META,
+    INFER_RTC_SET_REG(RTC, INFER_BKP_TOTAL, app_state.infer_total_count);
+    INFER_RTC_SET_REG(RTC, INFER_BKP_META,
 			       ((uint32_t)INFER_STATE_MAGIC << 16) |
 			       ((uint32_t)ready << 8) |
 			       (uint32_t)count);
-	LL_RTC_BAK_SetRegister(RTC, INFER_BKP_LABELS0, labels_reg0);
-	LL_RTC_BAK_SetRegister(RTC, INFER_BKP_LABELS1, labels_reg1);
-	LL_RTC_BAK_SetRegister(RTC, INFER_BKP_LABELS2, labels_reg2);
+    INFER_RTC_SET_REG(RTC, INFER_BKP_LABELS0, labels_reg0);
+    INFER_RTC_SET_REG(RTC, INFER_BKP_LABELS1, labels_reg1);
+    INFER_RTC_SET_REG(RTC, INFER_BKP_LABELS2, labels_reg2);
 }
 
 static void infer_restore_state(void)
 {
 	uint32_t meta;
 	LL_PWR_EnableBkUpAccess();
-	meta = LL_RTC_BAK_GetRegister(RTC, INFER_BKP_META);
+    meta = INFER_RTC_GET_REG(RTC, INFER_BKP_META);
 	if ((meta >> 16) != INFER_STATE_MAGIC) {
 		for (int i = 0; i < 10; i++) {
 			app_state.infer_labels_window[i] = -1;
@@ -141,13 +182,13 @@ static void infer_restore_state(void)
 		return;
 	}
 
-	app_state.infer_total_count = LL_RTC_BAK_GetRegister(RTC, INFER_BKP_TOTAL);
+    app_state.infer_total_count = INFER_RTC_GET_REG(RTC, INFER_BKP_TOTAL);
 	app_state.infer_window_count = (uint8_t)(meta & 0xFFU);
 	app_state.infer_window_ready = (((meta >> 8) & 0x01U) != 0U);
 
-	uint32_t labels_reg0 = LL_RTC_BAK_GetRegister(RTC, INFER_BKP_LABELS0);
-	uint32_t labels_reg1 = LL_RTC_BAK_GetRegister(RTC, INFER_BKP_LABELS1);
-	uint32_t labels_reg2 = LL_RTC_BAK_GetRegister(RTC, INFER_BKP_LABELS2);
+    uint32_t labels_reg0 = INFER_RTC_GET_REG(RTC, INFER_BKP_LABELS0);
+    uint32_t labels_reg1 = INFER_RTC_GET_REG(RTC, INFER_BKP_LABELS1);
+    uint32_t labels_reg2 = INFER_RTC_GET_REG(RTC, INFER_BKP_LABELS2);
 	for (int i = 0; i < 4; i++) {
 		app_state.infer_labels_window[i] = (int8_t)((labels_reg0 >> (i * 8)) & 0xFFU);
 		app_state.infer_labels_window[i + 4] = (int8_t)((labels_reg1 >> (i * 8)) & 0xFFU);
