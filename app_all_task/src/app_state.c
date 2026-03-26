@@ -7,6 +7,9 @@
 
 /* Global application state instance */
 app_state_t app_state = {
+	.fw_version_major = APP_FW_VERSION_MAJOR,
+	.fw_version_minor = APP_FW_VERSION_MINOR,
+	.fw_version_patch = APP_FW_VERSION_PATCH,
 	.button_press_count = 0,
 	.led_state = false,
 	.last_solar_mv = 0,
@@ -14,8 +17,12 @@ app_state_t app_state = {
 	.last_temp_celsius = 0.0f,
 	.last_press_kpa = 0.0f,
 	.last_humidity_percent = 0.0f,
+	.imu_accel_x_g = 0.0f,
+	.imu_accel_y_g = 0.0f,
+	.imu_accel_z_g = 0.0f,
 	.voltage_read_count = 0,
 	.sensor_read_count = 0,
+	.imu_read_count = 0,
 	.ina_ch1_voltage_v = 0.0f,
 	.ina_ch2_voltage_v = 0.0f,
 	.ina_ch3_voltage_v = 0.0f,

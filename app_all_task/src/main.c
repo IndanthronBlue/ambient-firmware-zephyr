@@ -2,6 +2,9 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/lorawan/lorawan.h>
 #include <zephyr/device.h>
+#include <zephyr/dfu/mcuboot.h>
+#include <zephyr/storage/flash_map.h>
+
 
 #include "tasks.h"
 
@@ -11,10 +14,11 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 #define ACTIVE_WINDOW_MS (40U * 1000U)
 #define PERIOD_10S_MS    10000U
 #define IDLE_SLEEP_MAX_MS 2000U
-#define GPS_BOOTSTRAP_MAX_TRIES 3000U
+#define GPS_BOOTSTRAP_MAX_TRIES 250U
 #define GPS_BOOTSTRAP_DELAY_MS  1000U
-#define LORA_CONNECT_MAX_TRIES 3000U
-#define LORA_CONNECT_DELAY_MS  10000U
+#define LORA_CONNECT_MAX_TRIES 25U
+#define LORA_CONNECT_DELAY_MS  30000U
+#define SLOT1_AREA_ID          FIXED_PARTITION_ID(slot1_partition)
 
 static inline bool time_reached(uint32_t now, uint32_t deadline)
 {
@@ -61,13 +65,79 @@ static void enter_sleep_window(uint32_t delay_sec)
 	k_sleep(K_SECONDS(delay_sec));
 }
 
+static const char *swap_type_to_str(int swap_type)
+{
+	switch (swap_type) {
+	case BOOT_SWAP_TYPE_NONE:
+		return "none";
+	case BOOT_SWAP_TYPE_TEST:
+		return "test";
+	case BOOT_SWAP_TYPE_PERM:
+		return "perm";
+	case BOOT_SWAP_TYPE_REVERT:
+		return "revert";
+	case BOOT_SWAP_TYPE_FAIL:
+		return "fail";
+	default:
+		return "unknown";
+	}
+}
+
+static void log_boot_self_check(void)
+{
+	uint8_t active_slot = boot_fetch_active_slot();
+	int swap_type = mcuboot_swap_type();
+	bool img_confirmed = boot_is_img_confirmed();
+	struct mcuboot_img_header slot1_hdr;
+	int ret = boot_read_bank_header((uint8_t)SLOT1_AREA_ID, &slot1_hdr, sizeof(slot1_hdr));
+
+	if (swap_type >= 0) {
+		LOG_INF("Boot self-check: active_slot=%u swap_type=%d(%s) confirmed=%s",
+			(unsigned int)active_slot,
+			swap_type,
+			swap_type_to_str(swap_type),
+			img_confirmed ? "yes" : "no");
+	} else {
+		LOG_WRN("Boot self-check: active_slot=%u swap_type read failed: %d confirmed=%s",
+			(unsigned int)active_slot,
+			swap_type,
+			img_confirmed ? "yes" : "no");
+	}
+
+	if (ret == 0) {
+		LOG_INF("Boot self-check: slot1 version=%u.%u.%u+%u size=%u",
+			(unsigned int)slot1_hdr.h.v1.sem_ver.major,
+			(unsigned int)slot1_hdr.h.v1.sem_ver.minor,
+			(unsigned int)slot1_hdr.h.v1.sem_ver.revision,
+			(unsigned int)slot1_hdr.h.v1.sem_ver.build_num,
+			(unsigned int)slot1_hdr.h.v1.image_size);
+	} else {
+		LOG_WRN("Boot self-check: slot1 header read failed: %d", ret);
+	}
+}
+
+
 int main(void)
 {
-	LOG_INF("System started with distributed initialization");
+	LOG_INF("FW version: %u.%u.%u",
+		(unsigned int)app_state.fw_version_major,
+		(unsigned int)app_state.fw_version_minor,
+		(unsigned int)app_state.fw_version_patch);
+	log_boot_self_check();
 
-	task_sd_ensure_mounted();
+	int confirm_ret = boot_write_img_confirmed();
+	if (confirm_ret == 0) {
+		LOG_INF("MCUboot image confirmed");
+	} else {
+		LOG_WRN("MCUboot confirm skipped/failed: %d", confirm_ret);
+	}
 
-	k_msleep(1000);
+	task_i2c_debug_scan_startup();
+
+	if (task_ina3221_init() < 0) {
+		LOG_ERR("INA3221 worker init failed");
+	}
+
 
 	if (task_microphone_init() < 0) {
 		LOG_ERR("Mic init failed");
@@ -76,14 +146,24 @@ int main(void)
 		LOG_INF("Mic ready (SAI1_B 16kHz)");
 	}
 
+
+	task_sd_ensure_mounted();
+	task_dfu_check_and_apply();
+
+	k_msleep(1000);
+
 	(void)task_watchdog_init();
 	(void)task_comm_init();
 	task_rtc_init();
-	if (task_ina3221_init() < 0) {
-		LOG_ERR("INA3221 worker init failed");
-	}
 
-	//try acquiring GPS fix at startup to speed up first location acquisition and get initial location for any early events; if it fails, we'll just continue and try again later in the periodic window
+	task_sensor_sample();
+	if (task_imu_init() < 0) {
+		LOG_ERR("IMU init failed");
+	}
+	
+	task_imu_sample();
+	
+	// // try acquiring GPS fix at startup to speed up first location acquisition and get initial location for any early events; if it fails, we'll just continue and try again later in the periodic window
 	bool gps_bootstrap_ok = false;
 	for (uint32_t attempt = 1U; attempt <= GPS_BOOTSTRAP_MAX_TRIES; attempt++) {
 		LOG_INF("Startup GPS bootstrap attempt %u/%u",
@@ -181,6 +261,11 @@ int main(void)
 			task_microphone_capture_once();
 			uint32_t t1 = k_uptime_get_32();
 			log_task_timing("task_microphone_capture_once", slot_deadline, t0, t1);
+
+			t0 = k_uptime_get_32();
+			task_imu_sample();
+			t1 = k_uptime_get_32();
+			log_task_timing("task_imu_sample", slot_deadline, t0, t1);
 
 			task_watchdog_feed();
 			advance_deadline(&next_10s_deadline, PERIOD_10S_MS, now);

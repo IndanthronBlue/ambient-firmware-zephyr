@@ -8,8 +8,15 @@
 #include <stddef.h>
 #include <zephyr/drivers/rtc.h>
 
+#define APP_FW_VERSION_MAJOR 1U
+#define APP_FW_VERSION_MINOR 0U
+#define APP_FW_VERSION_PATCH 2U
+
 /* ========== Task State Structure ========== */
 typedef struct {
+	uint16_t fw_version_major;
+	uint16_t fw_version_minor;
+	uint16_t fw_version_patch;
 	uint32_t button_press_count;
 	bool led_state;
 	uint16_t last_solar_mv;
@@ -17,8 +24,12 @@ typedef struct {
 	float last_temp_celsius;
 	float last_press_kpa;
 	float last_humidity_percent;
+	float imu_accel_x_g;
+	float imu_accel_y_g;
+	float imu_accel_z_g;
 	uint32_t voltage_read_count;
 	uint32_t sensor_read_count;
+	uint32_t imu_read_count;
 	/* INA3221 readings */
 	float ina_ch1_voltage_v;
 	float ina_ch2_voltage_v;
@@ -107,6 +118,9 @@ void task_voltage_monitor(void);
 
 void task_sensor_sample(void);
 
+int task_imu_init(void);
+void task_imu_sample(void);
+
 int task_ina3221_init(void);
 void task_ina3221_monitor(void);
 
@@ -130,6 +144,8 @@ void task_storage_set_session_id(uint32_t session_id);
 void task_sd_list_root(void);
 void task_status_persist(void);
 
+void task_dfu_check_and_apply(void);
+
 
 int task_lorawan_connect(void);
 int task_lorawan_send_event_uplink(void);
@@ -139,6 +155,7 @@ void task_gps_poll(void);
 bool task_gps_acquire_for_uplink(void);
 void task_i2c1_lock(void);
 void task_i2c1_unlock(void);
+void task_i2c_debug_scan_startup(void);
 
 
 int task_inference_init(void);

@@ -8,6 +8,9 @@
 
 LOG_MODULE_REGISTER(adc3101, LOG_LEVEL_INF);
 
+#define ADC3101_MICPGA_GAIN_DB      46U
+#define ADC3101_ADC_DIGITAL_GAIN_DB 8U
+
 /* Internal state */
 static const struct device *s_i2c = NULL;
 static uint8_t s_addr = ADC3101_ADDR00;
@@ -171,9 +174,9 @@ void adc3101_setup(void)
     LOG_DBG("Program MICBIAS: MICBIAS1 = 3.3V, MICBIAS2 = 3.3V");
     (void)adc3101_write_retry(0x33, 0b01111000, 8, 5, true); /* 3.3V */
 
-    LOG_DBG("Program MicPGA: Left/Right = 40dB");
-    (void)adc3101_write_retry(0x3b, 0b01010000, 8, 5, true); /* Left 40dB */
-    (void)adc3101_write_retry(0x3c, 0b01010000, 8, 5, true); /* Right 40dB */
+    LOG_INF("Program MicPGA: Left/Right = %udB", ADC3101_MICPGA_GAIN_DB);
+    (void)adc3101_write_retry(0x3b, (uint8_t)(ADC3101_MICPGA_GAIN_DB * 2U), 8, 5, true);
+    (void)adc3101_write_retry(0x3c, (uint8_t)(ADC3101_MICPGA_GAIN_DB * 2U), 8, 5, true);
 
     LOG_DBG("Input selection: IN1L/IN1R as Single-Ended");
     (void)adc3101_write_retry(0x34, 0b00111111, 8, 5, true); /* Left ADC input selection */
@@ -195,9 +198,9 @@ void adc3101_setup(void)
     LOG_DBG("Unmute digital volume control and set gain = 0 dB");
     (void)adc3101_write_retry(0x52, 0b00000000, 8, 5, true);
 
-    LOG_DBG("Set left/right ADC volume control = 5 dB");
-    (void)adc3101_write_retry(0x53, 0b00001010, 8, 5, true); /* 5 dB */
-    (void)adc3101_write_retry(0x54, 0b00001010, 8, 5, true); /* 5 dB */
+    LOG_DBG("Set left/right ADC volume control = %u dB", ADC3101_ADC_DIGITAL_GAIN_DB);
+    (void)adc3101_write_retry(0x53, (uint8_t)(ADC3101_ADC_DIGITAL_GAIN_DB * 2U), 8, 5, true);
+    (void)adc3101_write_retry(0x54, (uint8_t)(ADC3101_ADC_DIGITAL_GAIN_DB * 2U), 8, 5, true);
 
 #if 1 /* High-pass filter */
     LOG_DBG("5. Program filters");

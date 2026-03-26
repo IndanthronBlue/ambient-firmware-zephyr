@@ -8,7 +8,9 @@ project(app_bird)
 target_sources(app PRIVATE
     src/main.c
     src/app_state.c
+    src/dfu_task.c
     src/sensor_task.c
+    src/imu_task.c
     src/ina3221_task.c
     src/storage_task.c
     src/microphone_task.c
@@ -16,6 +18,7 @@ target_sources(app PRIVATE
     src/ADC3101.c
     src/lorawan_task.c
     src/gps_task.c
+    src/i2c_task.c
     src/rtc_task.c
     src/system_task.c
     src/comm_task.c

@@ -16,13 +16,13 @@
 	compatible = "leat,stm32l496g-bird";
 
 	chosen {
-		//zephyr,console = &usart2;
-		//zephyr,shell-uart = &usart2;
-		zephyr,console = &cdc_acm_uart0;
-		zephyr,shell-uart = &cdc_acm_uart0;
+		zephyr,console = &usart2;
+		zephyr,shell-uart = &usart2;
+		//zephyr,console = &cdc_acm_uart0;
+		//zephyr,shell-uart = &cdc_acm_uart0;
 		zephyr,sram = &sram0;
 		zephyr,flash = &flash0;
-		zephyr,flash-controller = &mx25r6435;
+		//zephyr,flash-controller = &mx25r6435;
 	};
 	
 	/* Custom pinctrl for SPI1 MISO with pull-up */
@@ -55,14 +55,18 @@
 			label = "Hall";
 			gpios = <&gpioa 7 GPIO_ACTIVE_LOW>;
 		};
-        gps_main_power: gps_main_pwr {
-            gpios = <&gpiob 11 GPIO_ACTIVE_HIGH>;
-            label = "GPS Main Power";
-        };
-        gps_backup_power: gps_backup_pwr {
-            gpios = <&gpiob 6 GPIO_ACTIVE_HIGH>;
-            label = "GPS Backup Power";
-        };
+		gps_init: gps_init {
+			gpios = <&gpiob 10 GPIO_ACTIVE_HIGH>;
+			label = "GPS INIT";
+		};
+		gps_on_off: gps_on_off {
+			gpios = <&gpiob 11 GPIO_ACTIVE_HIGH>;
+			label = "GPS ON OFF";
+		};
+		gps_vbckp: gps_vbckp {
+			gpios = <&gpioa 6 GPIO_ACTIVE_HIGH>;
+			label = "GPS V_BCKP ON OFF";
+		};
 	};
 
 	vbatt {
@@ -93,8 +97,9 @@
 		hall0 = &hall;
 		mcuboot-led0 = &led;
 		mcuboot-button0 = &user_button;
-		gps-main-pwr = &gps_main_power;
-        gps-backup-pwr = &gps_backup_power;
+		gps-init = &gps_init;
+		gps-on-off = &gps_on_off;
+		gps-vbckp = &gps_vbckp;
 	};
 
 	/* Custom pinctrl for SPI3 MISO with pull-up */
@@ -327,26 +332,38 @@ zephyr_udc0: &usbotg_fs {
 	status = "okay";
 };
 
-&quadspi {
-	pinctrl-0 = <&quadspi_bk1_io0_pb1 &quadspi_bk1_io1_pb0
-		     &quadspi_bk1_io2_pa7 &quadspi_bk1_io3_pa6
-		     &quadspi_bk1_ncs_pb11 &quadspi_clk_pa3>;
-	pinctrl-names = "default";
 
-	dmas = <&dma2 7 3 STM32_DMA_PERIPH_RX>; /* channel 7 request 3 on DMA2 */
-	dma-names = "tx_rx";
+/* 为DFU准备空间 */
+&flash0 {
+    partitions {
+        compatible = "fixed-partitions";
+        #address-cells = <1>;
+        #size-cells = <1>;
 
-	flash-id = <1>;
-	status = "okay";
-
-	mx25r6435: qspi-nor-flash@0 {
-		compatible = "st,stm32-qspi-nor";
-		reg = <0>;
-		size = <DT_SIZE_M(64)>; /* 64 Mbits */
-		qspi-max-frequency = <8000000>;
-		cs-high-time = <3>; /* >= 30 ns */
-		status = "okay";
-		spi-bus-width = <4>;
-		writeoc = "PP_1_4_4";
-	};
+        /* MCUboot 引导程序占用 64KB */
+        boot_partition: partition@0 {
+            label = "mcuboot";
+            reg = <0x00000000 0x00010000>;
+        };
+        /* 主程序插槽 Slot 0：416KB */
+        slot0_partition: partition@10000 {
+            label = "image-0";
+            reg = <0x00010000 0x00068000>;
+        };
+        /* 备用程序插槽 Slot 1：416KB */
+        slot1_partition: partition@78000 {
+            label = "image-1";
+            reg = <0x00078000 0x00068000>;
+        };
+        /* 交换区 Scratch：64KB (MCUboot交换固件时需要) */
+        scratch_partition: partition@e0000 {
+            label = "image-scratch";
+            reg = <0x000E0000 0x00010000>;
+        };
+        /* 剩余 64KB 用于用户数据存储 (可选) */
+        storage_partition: partition@f0000 {
+            label = "storage";
+            reg = <0x000F0000 0x00010000>;
+        };
+    };
 };

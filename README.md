@@ -112,6 +112,44 @@ west build -p always -b stm32l496g_bird app/ambient_firmware_zephyr/app_all_task
 west flash
 ```
 
+## 4.1 SD Card DFU Update Flow (New)
+
+SD-card-based DFU is now supported. For first-time deployment, follow this order:
+
+1. Full chip erase (required)
+    - Erase the entire MCU flash first to avoid boot issues from old partitions/bootloader remnants.
+    - You can do this in STM32CubeProgrammer, or use a flashing flow that supports full erase 
+    ```
+    STM32CLI=/your/path/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI
+    `$STM32CLI -c port=SWD mode=UR -e all`.
+    ```
+
+2. Build and flash the official MCUboot first
+    - Build MCUboot and flash it to the board before the application firmware.
+    - Use an overlay that sets the firmware partition layout to `boot_partition` (bootloader-first layout).
+
+    ```
+    / {
+        chosen {
+            zephyr,console = &usart2;
+            zephyr,shell-uart = &usart2;
+            zephyr,code-partition = &boot_partition;
+        };
+    };
+    ```
+    ```
+    ~/zephyrproject/bootloader/mcuboot/boot/zephyr$ west build -p always -b stm32l496g_bird
+    ```
+
+3. Build and flash the application firmware
+    - After MCUboot is in place, build and flash the `app_all_task` firmware.
+
+4. Future firmware updates (offline via SD card)
+    - In the application build output folder, find `zephyr.signed.bin`.
+    - Rename it to `update.bin`.
+    - Copy `update.bin` to the root directory of the SD card.
+    - Insert the SD card into the board and reboot; DFU update will run automatically.
+
 ## 5. Serial Log Monitoring
 
 The app overlay routes console to `USART2` at `115200` baud.

@@ -1,0 +1,10 @@
+description: Kionix KXTJ3-1057 3-axis accelerometer
+
+compatible: "kionix,kxtj3-1057"
+
+include: [sensor-device.yaml, i2c-device.yaml]
+
+properties:
+  friendly-name:
+    type: string
+    description: Human readable sensor name

@@ -6,8 +6,11 @@
 	};
 
 	chosen {
+		//zephyr,console = &cdc_acm_uart0;
+		//zephyr,shell-uart = &cdc_acm_uart0;
 		zephyr,console = &usart2;
 		zephyr,shell-uart = &usart2;
+		zephyr,code-partition = &slot0_partition;
 	};
 };
 
@@ -56,7 +59,7 @@
 };
 
 &zephyr_udc0 {
-	status = "disabled";
+	status = "okay";
 };
 
 &i2c2 {
@@ -84,5 +87,10 @@
 &i2c1 {
 	/* Lower bitrate for more robust GNSS NMEA-over-I2C */
 	clock-frequency = <100000>;
+	kxtj3: kxtj3@f {
+		compatible = "kionix,kxtj3-1057";
+		reg = <0x0f>;
+		status = "okay";
+	};
 	status = "okay";
 };
