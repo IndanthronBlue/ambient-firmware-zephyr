@@ -3,66 +3,52 @@
 #include <zephyr/lorawan/lorawan.h>
 #include <zephyr/device.h>
 #include <zephyr/dfu/mcuboot.h>
+#include <zephyr/pm/policy.h>
+#include <zephyr/pm/state.h>
 #include <zephyr/storage/flash_map.h>
-
+#include <zephyr/sys/poweroff.h>
+#include <zephyr/drivers/hwinfo.h>
 
 #include "tasks.h"
+#include "app_feature_flags.h"
+#include "retained_state.h"
 
 LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 
-#define SLEEP_WAKEUP_SEC 20
-#define ACTIVE_WINDOW_MS (40U * 1000U)
-#define PERIOD_10S_MS    10000U
-#define IDLE_SLEEP_MAX_MS 2000U
-#define GPS_BOOTSTRAP_MAX_TRIES 250U
-#define GPS_BOOTSTRAP_DELAY_MS  1000U
-#define LORA_CONNECT_MAX_TRIES 25U
-#define LORA_CONNECT_DELAY_MS  30000U
-#define SLOT1_AREA_ID          FIXED_PARTITION_ID(slot1_partition)
+#define APP_BOOT_COLD_POWERCYCLE_MS 250U
+#define APP_DEEP_SLEEP_WAKE_SEC     (3U * 60U * 60U)
+#define APP_BOOT_GPS_SYNC_TIMEOUT_MS (3U * 60U * 1000U)
+#define APP_BOOT_GPS_RETRY_DELAY_MS  5000U
 
-static inline bool time_reached(uint32_t now, uint32_t deadline)
-{
-	return (int32_t)(now - deadline) >= 0;
-}
+#define SLOT1_AREA_ID              FIXED_PARTITION_ID(slot1_partition)
+#define APP_STARTUP_I2C_SCAN_ENABLED 0
 
-static inline uint32_t ms_until(uint32_t now, uint32_t deadline)
+static bool app_pm_boot_guard_locked;
+
+static void app_pm_boot_guard_lock(void)
 {
-	if (time_reached(now, deadline)) {
-		return 0U;
+#if IS_ENABLED(CONFIG_PM)
+	if (app_pm_boot_guard_locked) {
+		return;
 	}
-	return (uint32_t)(deadline - now);
+
+	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+	app_pm_boot_guard_locked = true;
+	LOG_INF("[PWR] Boot guard: lock all SUSPEND_TO_IDLE substates during init");
+#endif
 }
 
-static void advance_deadline(uint32_t *deadline, uint32_t period_ms, uint32_t now)
+static void app_pm_boot_guard_unlock(void)
 {
-	do {
-		*deadline += period_ms;
-	} while (time_reached(now, *deadline));
-}
+#if IS_ENABLED(CONFIG_PM)
+	if (!app_pm_boot_guard_locked) {
+		return;
+	}
 
-static uint32_t min_u32(uint32_t a, uint32_t b)
-{
-	return (a < b) ? a : b;
-}
-
-static void log_task_timing(const char *task_name,
-			    uint32_t scheduled_deadline_ms,
-			    uint32_t start_ms,
-			    uint32_t end_ms)
-{
-	int32_t schedule_lag_ms = (int32_t)(start_ms - scheduled_deadline_ms);
-	uint32_t exec_ms = (uint32_t)(end_ms - start_ms);
-	LOG_INF("[%s] sched=%u start=%u lag=%dms exec=%ums",
-		task_name,
-		(unsigned int)scheduled_deadline_ms,
-		(unsigned int)start_ms,
-		(int)schedule_lag_ms,
-		(unsigned int)exec_ms);
-}
-
-static void enter_sleep_window(uint32_t delay_sec)
-{
-	k_sleep(K_SECONDS(delay_sec));
+	pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+	app_pm_boot_guard_locked = false;
+	LOG_INF("[PWR] Boot guard: unlock SUSPEND_TO_IDLE substates (PM active)");
+#endif
 }
 
 static const char *swap_type_to_str(int swap_type)
@@ -116,13 +102,112 @@ static void log_boot_self_check(void)
 	}
 }
 
+static void enter_deep_sleep_or_simulate(void)
+{
+	int alarm_ret = task_rtc_set_alarm_in_seconds(APP_DEEP_SLEEP_WAKE_SEC);
+	LOG_INF("[PWR] low-bat recovery RTC alarm ret=%d", alarm_ret);
+
+	if (APP_DEEP_SLEEP_ENABLED && !APP_DEEP_SLEEP_SIMULATE_ENABLED) {
+		LOG_INF("[PWR] Entering deep sleep by sys_poweroff() -> STM32U5 shutdown");
+		power_ctrl_prepare_deep_sleep_all();
+		task_rtc_prepare_shutdown_wakeup_route();
+		k_msleep(200);
+		sys_poweroff();
+		return;
+	}
+
+	LOG_WRN("[PWR] Deep sleep simulate enabled; sleeping %u sec",
+		(unsigned int)APP_DEEP_SLEEP_WAKE_SEC);
+	k_sleep(K_SECONDS(APP_DEEP_SLEEP_WAKE_SEC));
+}
+
+static bool is_gps_time_legal(void)
+{
+	uint32_t now_epoch = 0U;
+	struct retained_state_v1 retained;
+
+	if (task_rtc_get_epoch_utc(&now_epoch) < 0) {
+		return false;
+	}
+
+	if (retained_state_load(&retained) < 0) {
+		return false;
+	}
+
+	if (retained.last_gps_sync_epoch == 0U) {
+		return false;
+	}
+
+	return now_epoch >= retained.last_gps_sync_epoch;
+}
+
+static void ensure_boot_gps_time_blocking(void)
+{
+	uint32_t start_ms = k_uptime_get_32();
+
+	while ((k_uptime_get_32() - start_ms) < APP_BOOT_GPS_SYNC_TIMEOUT_MS) {
+		bool rtc_synced = false;
+		uint32_t elapsed_ms = k_uptime_get_32() - start_ms;
+		uint32_t remain_ms = APP_BOOT_GPS_SYNC_TIMEOUT_MS - elapsed_ms;
+
+		LOG_INF("[BOOT] GPS time sync attempt start (remain=%u ms)",
+			(unsigned int)remain_ms);
+		if (task_gps_acquire_with_timeout(remain_ms, &rtc_synced) && rtc_synced &&
+		    is_gps_time_legal()) {
+			LOG_INF("[BOOT] GPS legal time ready");
+			return;
+		}
+
+		if ((k_uptime_get_32() - start_ms) >= APP_BOOT_GPS_SYNC_TIMEOUT_MS) {
+			break;
+		}
+
+		LOG_WRN("[BOOT] GPS time sync not ready, retry in %u ms",
+			(unsigned int)APP_BOOT_GPS_RETRY_DELAY_MS);
+		k_sleep(K_MSEC(APP_BOOT_GPS_RETRY_DELAY_MS));
+	}
+
+	LOG_ERR("[BOOT] GPS time sync failed within %u ms",
+		(unsigned int)APP_BOOT_GPS_SYNC_TIMEOUT_MS);
+}
+
+static bool app_boot_is_shutdown_wake_reboot(bool reset_cause_valid, uint32_t reset_cause)
+{
+	return reset_cause_valid && ((reset_cause & RESET_LOW_POWER_WAKE) != 0U);
+}
 
 int main(void)
 {
+	app_pm_boot_guard_lock();
+
+	uint32_t reset_cause = 0U;
+	bool reset_cause_valid = (hwinfo_get_reset_cause(&reset_cause) == 0);
+	if (reset_cause_valid) {
+		hwinfo_clear_reset_cause();
+	}
+
 	LOG_INF("FW version: %u.%u.%u",
 		(unsigned int)app_state.fw_version_major,
 		(unsigned int)app_state.fw_version_minor,
 		(unsigned int)app_state.fw_version_patch);
+	LOG_INF("Feature flags: fsm=%d deep=%d retention=%d deep_sim=%d",
+		APP_LOW_POWER_FSM_ENABLED,
+		APP_DEEP_SLEEP_ENABLED,
+		APP_RETENTION_ENABLED,
+		APP_DEEP_SLEEP_SIMULATE_ENABLED);
+	LOG_INF("Wake source flags: button=%d periodic=%d comm=%d rtc=%d sound=%d low_bat=%d",
+		APP_WAKEUP_SRC_BUTTON_ENABLED,
+		APP_WAKEUP_SRC_PERIODIC_ENABLED,
+		APP_WAKEUP_SRC_COMM_ENABLED,
+		APP_WAKEUP_SRC_RTC_ALARM_ENABLED,
+		APP_WAKEUP_SRC_SOUND_ENABLED,
+		APP_WAKEUP_SRC_LOW_BAT_ENABLED);
+	if (reset_cause_valid) {
+		LOG_INF("[BOOT] reset_cause=0x%08x low_power=%d shutdown_wake_reboot=%d",
+			(unsigned int)reset_cause,
+			(reset_cause & RESET_LOW_POWER_WAKE) != 0U ? 1 : 0,
+			app_boot_is_shutdown_wake_reboot(reset_cause_valid, reset_cause) ? 1 : 0);
+	}
 	log_boot_self_check();
 
 	int confirm_ret = boot_write_img_confirmed();
@@ -132,171 +217,104 @@ int main(void)
 		LOG_WRN("MCUboot confirm skipped/failed: %d", confirm_ret);
 	}
 
-	task_i2c_debug_scan_startup();
+	if (app_boot_is_shutdown_wake_reboot(reset_cause_valid, reset_cause)) {
+		LOG_INF("[BOOT] Detected RTC/deep-sleep shutdown wake reboot; boot flow restarts from main()");
+	}
+
+	(void)task_rtc_init();
+
+	(void)task_comm_init();
+
+	if (APP_WAKEUP_SRC_BUTTON_ENABLED) {
+		(void)task_button_init();
+	} else {
+		LOG_INF("[PWR] button wakeup source disabled by config");
+	}
+
+	if (APP_WAKEUP_SRC_SOUND_ENABLED) {
+		(void)task_sound_wakeup_init();
+	} else {
+		LOG_INF("[PWR] sound wakeup source disabled by config");
+	}
+
+	/* Arduino-style cold power-cycle before codec/mic init to discharge
+	 * v_periph rail and start ADC3101 from a clean state.
+	 */
+	(void)power_ctrl_vperiph_off();
+	k_msleep(APP_BOOT_COLD_POWERCYCLE_MS);
+	(void)power_ctrl_vperiph_on();
+
+	uint32_t mic_init_start_ms = k_uptime_get_32();
+	
+	int mic_init_ret = task_microphone_init();
+
+	uint32_t mic_init_cost_ms = k_uptime_get_32() - mic_init_start_ms;
+	LOG_INF("[BOOT] microphone init ret=%d cost=%u ms",
+		mic_init_ret,
+		(unsigned int)mic_init_cost_ms);
+	if (mic_init_ret < 0) {
+		LOG_ERR("Mic init failed");
+	}
+
+	uint32_t sd_init_start_ms = k_uptime_get_32();
+	task_sd_ensure_mounted();
+	uint32_t sd_init_cost_ms = k_uptime_get_32() - sd_init_start_ms;
+	LOG_INF("[BOOT] sd ensure mounted cost=%u ms", (unsigned int)sd_init_cost_ms);
+
+	task_dfu_check_and_apply();
+	task_sensor_sample();
+
+	
+	// if (task_imu_init() < 0) {
+	// 	LOG_ERR("IMU init failed");
+	// }
+	// task_imu_sample();
+
+	if (task_lorawan_connect() != 0) {
+		LOG_WRN("Startup LoRaWAN connect failed; will retry during runtime");
+	}
 
 	if (task_ina3221_init() < 0) {
 		LOG_ERR("INA3221 worker init failed");
 	}
 
-
-	if (task_microphone_init() < 0) {
-		LOG_ERR("Mic init failed");
-	} else {
-		task_inference_resume_after_wakeup();
-		LOG_INF("Mic ready (SAI1_B 16kHz)");
-	}
-
-
-	task_sd_ensure_mounted();
-	task_dfu_check_and_apply();
-
-	k_msleep(1000);
-
 	(void)task_watchdog_init();
-	(void)task_comm_init();
-	task_rtc_init();
+	LOG_INF("[BOOT] All devices initialized; watchdog active");
 
-	task_sensor_sample();
-	if (task_imu_init() < 0) {
-		LOG_ERR("IMU init failed");
+	if (APP_RETENTION_ENABLED) {
+		int retained_ret = retained_state_init_or_reset();
+		if (retained_ret < 0) {
+			LOG_WRN("[BOOT] retained_state_init_or_reset failed: %d", retained_ret);
+		}
+	}
+
+	if (task_ina3221_read_now() == 0) {
+		int32_t batt_mv = (int32_t)(app_state.ina_ch2_voltage_v * 1000.0f);
+		LOG_INF("[BOOT] battery after wake = %d mV", (int)batt_mv);
+		if (batt_mv < APP_LOW_BATTERY_MV) {
+			LOG_WRN("[BOOT] battery still low after wake, re-enter shutdown");
+			enter_deep_sleep_or_simulate();
+			return 0;
+		}
 	}
 	
-	task_imu_sample();
-	
-	// // try acquiring GPS fix at startup to speed up first location acquisition and get initial location for any early events; if it fails, we'll just continue and try again later in the periodic window
-	bool gps_bootstrap_ok = false;
-	for (uint32_t attempt = 1U; attempt <= GPS_BOOTSTRAP_MAX_TRIES; attempt++) {
-		LOG_INF("Startup GPS bootstrap attempt %u/%u",
-			(unsigned int)attempt,
-			(unsigned int)GPS_BOOTSTRAP_MAX_TRIES);
-		if (task_gps_acquire_for_uplink()) {
-			gps_bootstrap_ok = true;
-			LOG_INF("Startup GPS bootstrap succeeded on attempt %u",
-				(unsigned int)attempt);
-			break;
-		}
-		if (attempt < GPS_BOOTSTRAP_MAX_TRIES) {
-			k_msleep(GPS_BOOTSTRAP_DELAY_MS);
-		}
+	ensure_boot_gps_time_blocking();
+
+	if (power_fsm_init() < 0) {
+		LOG_ERR("power_fsm_init failed");
 	}
-	if (!gps_bootstrap_ok) {
-		LOG_WRN("Startup GPS bootstrap failed after %u attempts; continuing without initial fix",
-			(unsigned int)GPS_BOOTSTRAP_MAX_TRIES);
-	}
+	LOG_INF("Power FSM scheduler started");
 
-	task_watchdog_feed();
-
-	k_msleep(15000);
-
-	// like gps, try connecting to LoRaWAN at startup to speed up first uplink; if it fails, we'll just continue and try again later in the periodic window
-	bool lorawan_connected = false;
-	for (uint32_t attempt = 1U; attempt <= LORA_CONNECT_MAX_TRIES; attempt++) {
-		LOG_INF("Startup LoRaWAN connect attempt %u/%u", (unsigned int)attempt, (unsigned int)LORA_CONNECT_MAX_TRIES);
-		if (task_lorawan_connect() == 0) {
-			lorawan_connected = true;
-			LOG_INF("Startup LoRaWAN connect succeeded on attempt %u", (unsigned int)attempt);
-			break;
-		}
-		k_msleep(LORA_CONNECT_DELAY_MS);
-	}
-	if (!lorawan_connected) {
-		LOG_WRN("Startup LoRaWAN connect failed after %u attempts; continuing without network", (unsigned int)LORA_CONNECT_MAX_TRIES);
-	}
-
-	uint32_t now = k_uptime_get_32();
-	uint32_t active_window_deadline = now + ACTIVE_WINDOW_MS;
-	uint32_t next_10s_deadline = now;
-	bool sd_mount_checked_in_window = false;
-	bool sd_checked_in_window = false;
-
-	LOG_INF("Window scheduler started: active=%u ms, sleep=%u s(k_sleep)",
-		(unsigned int)ACTIVE_WINDOW_MS, (unsigned int)SLEEP_WAKEUP_SEC);
+	app_pm_boot_guard_unlock();
+	LOG_INF("[BOOT] Init complete, entering normal runtime");
 
 	while (1) {
-
-		now = k_uptime_get_32();
-		task_watchdog_feed();
-		task_system_periodic_reboot_check();
-
-		if (time_reached(now, active_window_deadline)) {
-			LOG_INF("Active window complete, entering k_sleep");
-			enter_sleep_window(SLEEP_WAKEUP_SEC);
-			if (!task_microphone_is_initialized()) {
-				if (task_microphone_init() < 0) {
-					LOG_ERR("Mic re-init failed after sleep");
-				} else {
-					LOG_INF("Mic re-initialized after sleep");
-				}
-			}
-			now = k_uptime_get_32();
-			active_window_deadline = now + ACTIVE_WINDOW_MS;
-			next_10s_deadline = now;
-			sd_mount_checked_in_window = false;
-			sd_checked_in_window = false;
-			continue;
-		}
-
-		/* At each active-window start: verify SD mount, try remount if needed. */
-		if (!sd_mount_checked_in_window) {
-			uint32_t t0 = k_uptime_get_32();
-			task_sd_ensure_mounted();
-			uint32_t t1 = k_uptime_get_32();
-			log_task_timing("task_sd_ensure_mounted", now, t0, t1);
-			sd_mount_checked_in_window = true;
-		}
-
-		/* Check SD free capacity once in each active window. */
-		if (!sd_checked_in_window) {
-			uint32_t t0 = k_uptime_get_32();
-			task_sd_check_capacity();
-			uint32_t t1 = k_uptime_get_32();
-			log_task_timing("task_sd_check_capacity", now, t0, t1);
-			sd_checked_in_window = true;
-		}
-
-		if (time_reached(now, next_10s_deadline)) {
-			LOG_INF("Starting scheduled audio capture + inference");
-			uint32_t slot_deadline = next_10s_deadline;
-			uint32_t t0 = k_uptime_get_32();
-			task_microphone_capture_once();
-			uint32_t t1 = k_uptime_get_32();
-			log_task_timing("task_microphone_capture_once", slot_deadline, t0, t1);
-
-			t0 = k_uptime_get_32();
-			task_imu_sample();
-			t1 = k_uptime_get_32();
-			log_task_timing("task_imu_sample", slot_deadline, t0, t1);
-
-			task_watchdog_feed();
-			advance_deadline(&next_10s_deadline, PERIOD_10S_MS, now);
-		}
-
-		/* Event chain: every 10 inferences -> queue comm worker. */
-		if (app_state.infer_window_ready) {
-			uint32_t t0 = k_uptime_get_32();
-			task_sensor_sample();
-			uint32_t t1 = k_uptime_get_32();
-			log_task_timing("task_sensor_sample(pre_lora)", now, t0, t1);
-			LOG_INF("Inference event(10): queue GPS->LoRa worker");
-			task_inference_snapshot_uplink_window();
-			task_comm_request_uplink();
-		}
-
-		now = k_uptime_get_32();
-		uint32_t next_deadline = active_window_deadline;
-		next_deadline = min_u32(next_deadline, next_10s_deadline);
-		uint32_t sleep_ms = ms_until(now, next_deadline);
-		if (sleep_ms > IDLE_SLEEP_MAX_MS) {
-			sleep_ms = IDLE_SLEEP_MAX_MS;
-		}
-
-		if (sleep_ms > 0U) {
-			k_msleep(sleep_ms);
-		} else {
-			k_yield();
-		}
-		
-		// k_msleep(5000);
+		power_fsm_tick();
+		k_timeout_t timeout = power_fsm_next_wait_timeout();
+		uint32_t timeout_ms = k_ticks_to_ms_floor32(timeout.ticks);
+		LOG_INF("Power FSM waiting for event or timeout (%u ms)",
+			(unsigned int)timeout_ms);
+		power_fsm_wait_for_event(timeout);
 	}
 
 	return 0;

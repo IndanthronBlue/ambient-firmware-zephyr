@@ -22,4 +22,9 @@ target_sources(app PRIVATE
     src/rtc_task.c
     src/system_task.c
     src/comm_task.c
+    src/button_task.c
+    src/sound_wakeup_task.c
+    src/power_fsm.c
+    src/retained_state.c
+    src/power_ctrl.c
 )

@@ -1,8 +1,28 @@
+#include <zephyr/dt-bindings/gpio/gpio.h>
+
 /* Board-specific overlay to enable SAI1 Block B and correct audio PLL setup */
 
 / {
 	aliases {
 		rtc = &rtc;
+		sound-wakeup-en = &sound_wakeup_en;
+		sound-wakeup-irq = &sound_wakeup_irq;
+	};
+
+	sound_wakeup_leds {
+		compatible = "gpio-leds";
+		sound_wakeup_en: sound_wakeup_en {
+			gpios = <&gpioa 10 GPIO_ACTIVE_HIGH>;
+			label = "sound_wakeup_en";
+		};
+	};
+
+	sound_wakeup_keys {
+		compatible = "gpio-keys";
+		sound_wakeup_irq: sound_wakeup_irq {
+			gpios = <&gpioa 15 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+			label = "sound_wakeup_irq";
+		};
 	};
 
 	chosen {
@@ -82,6 +102,16 @@
 
 &iwdg {
 	status = "okay";
+};
+
+&rtc {
+	status = "okay";
+	wakeup-source;
+};
+
+&gpioa {
+	status = "okay";
+	wakeup-source;
 };
 
 &i2c1 {

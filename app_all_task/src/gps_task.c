@@ -20,6 +20,8 @@
 LOG_MODULE_REGISTER(gps_task, LOG_LEVEL_INF);
 
 #include "tasks.h"
+#include "app_feature_flags.h"
+#include "retained_state.h"
 
 /* Bind I2C1 device for GPS per board DTS */
 static const struct device *gps_i2c = DEVICE_DT_GET(DT_NODELABEL(i2c1));
@@ -31,9 +33,9 @@ static const struct device *gps_i2c = DEVICE_DT_GET(DT_NODELABEL(i2c1));
 #define GPS_ADDR 0x10
 #endif
 
-/* GPS main and backup power from board DTS gpio_keys labels */
-static const struct gpio_dt_spec gps_en = GPIO_DT_SPEC_GET(DT_NODELABEL(gps_on_off), gpios);
-static const struct gpio_dt_spec gps_backup = GPIO_DT_SPEC_GET(DT_NODELABEL(gps_vbckp), gpios);
+/* GPS power control is centralized in power_ctrl.c to ensure
+ * v_periph and GPS enable sequencing stay consistent.
+ */
 
 /* Internal state */
 static bool initialized = false;
@@ -80,41 +82,20 @@ static void gps_mark_failure(uint32_t now_ms, const char *reason)
 
 static int gps_power_on(void)
 {
-    int ret = 0;
-    /* 1) Skip GPS backup-power GPIO.
-     * On this board/profile PB6 is used by SAI1_B FS, and driving it as GPIO
-     * breaks audio capture (RX all zeros).
-     */
-    if (gps_backup.port) {
-        ret = gpio_pin_configure_dt(&gps_backup, GPIO_OUTPUT);
-        if (ret) {
-            LOG_ERR("gps_backup configure failed: %d", ret);
-            return ret;
-        }
-        /* Ensure low, then high */
-        gpio_pin_set_dt(&gps_backup, 1);
-        LOG_INF("GPS backup power enabled (PA6)");
+    int ret = power_ctrl_gps_on();
+    if (ret < 0) {
+        return ret;
     }
-    /* 2) Enable main power (PB11) */
-    if (gps_en.port) {
-        ret = gpio_pin_configure_dt(&gps_en, GPIO_OUTPUT);
-        if (ret) {
-            LOG_ERR("gps_en configure failed: %d", ret);
-            return ret;
-        }
-        /* Ensure low, then high */
-        gpio_pin_set_dt(&gps_en, 0);
-        k_msleep(50);
-        gpio_pin_set_dt(&gps_en, 1);
-        LOG_INF("GPS main power enabled (PB11)");
-    }
-    /* 3) Wait GPS startup */
-    k_msleep(500);
-    /* 4) Initialize I2C (verify bus ready) */
+
+    /* Wait GPS startup; keep longer for runtime re-power validation */
+    k_msleep(2000);
+
+    /* Initialize I2C (verify bus ready) */
     if (!device_is_ready(gps_i2c)) {
         LOG_ERR("GPS I2C1 device not ready");
         return -ENODEV;
     }
+
     task_i2c1_lock();
     (void)i2c_recover_bus(gps_i2c);
     task_i2c1_unlock();
@@ -123,9 +104,66 @@ static int gps_power_on(void)
 
 static void gps_power_off(void)
 {
-    if (gps_en.port) {
-        gpio_pin_set_dt(&gps_en, 0);
-    }
+	initialized = false;
+	(void)power_ctrl_gps_off();
+}
+
+static bool gps_is_leap_year(int year)
+{
+	if ((year % 400) == 0) {
+		return true;
+	}
+
+	if ((year % 100) == 0) {
+		return false;
+	}
+
+	return (year % 4) == 0;
+}
+
+static uint8_t gps_days_in_month(int year, int month)
+{
+	static const uint8_t month_days[12] = {
+		31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+	};
+
+	uint8_t days = month_days[month - 1];
+	if ((month == 2) && gps_is_leap_year(year)) {
+		days = 29;
+	}
+
+	return days;
+}
+
+static void gps_apply_local_hour_offset(int *year, int *month, int *day, int *hour, int offset_hours)
+{
+	*hour += offset_hours;
+
+	while (*hour >= 24) {
+		*hour -= 24;
+		(*day)++;
+		if (*day > gps_days_in_month(*year, *month)) {
+			*day = 1;
+			(*month)++;
+			if (*month > 12) {
+				*month = 1;
+				(*year)++;
+			}
+		}
+	}
+
+	while (*hour < 0) {
+		*hour += 24;
+		(*day)--;
+		if (*day < 1) {
+			(*month)--;
+			if (*month < 1) {
+				*month = 12;
+				(*year)--;
+			}
+			*day = gps_days_in_month(*year, *month);
+		}
+	}
 }
 
 static float nmea_coord_to_decimal(const char *s)
@@ -179,6 +217,8 @@ static bool parse_rmc_line(const char *line, float *plat, float *plon)
     bool valid = false;
     char ns='N', ew='E';
     float lat = 0.0f, lon = 0.0f;
+    int utc_hour = -1, utc_minute = -1, utc_second = -1;
+    int date_day = -1, date_month = -1, date_year = -1;
     for (; *p; ++p) {
         if (*p == ',' || *p == '*') {
             token[tok_i] = '\0';
@@ -193,25 +233,16 @@ static bool parse_rmc_line(const char *line, float *plat, float *plon)
             } else if (field == 6 && token[0]) { /* E/W */
                 ew = token[0];
             } else if (field == 1) { /* time hhmmss.sss (UTC) */
-                /* Extract hour, minute, second */
                 if (strlen(token) >= 6) {
-                    int hh = (token[0]-'0')*10 + (token[1]-'0');
-                    int mm = (token[2]-'0')*10 + (token[3]-'0');
-                    int ss = (token[4]-'0')*10 + (token[5]-'0');
-                    app_state.time_hour = (uint8_t)hh + 1;
-                    app_state.time_minute = (uint8_t)mm;
-                    app_state.time_second = (uint8_t)ss;
+                    utc_hour = (token[0]-'0')*10 + (token[1]-'0');
+                    utc_minute = (token[2]-'0')*10 + (token[3]-'0');
+                    utc_second = (token[4]-'0')*10 + (token[5]-'0');
                 }
             } else if (field == 9) { /* date ddmmyy */
                 if (strlen(token) == 6) {
-                    int dd = (token[0]-'0')*10 + (token[1]-'0');
-                    int MM = (token[2]-'0')*10 + (token[3]-'0');
-                    int yy = (token[4]-'0')*10 + (token[5]-'0');
-                    app_state.time_day = (uint8_t)dd;
-                    app_state.time_month = (uint8_t)MM;
-                    app_state.time_year = (uint16_t)(2000 + yy);
-                    LOG_INF("GPS RMC date: %04u-%02u-%02u", (unsigned int)app_state.time_year,
-                            (unsigned int)app_state.time_month, (unsigned int)app_state.time_day);
+                    date_day = (token[0]-'0')*10 + (token[1]-'0');
+                    date_month = (token[2]-'0')*10 + (token[3]-'0');
+                    date_year = 2000 + (token[4]-'0')*10 + (token[5]-'0');
                 }
             }
             tok_i = 0;
@@ -224,6 +255,21 @@ static bool parse_rmc_line(const char *line, float *plat, float *plon)
     if (!valid) return false;
     if (ns == 'S') lat = -lat;
     if (ew == 'W') lon = -lon;
+
+    if ((utc_hour >= 0) && (utc_minute >= 0) && (utc_second >= 0) &&
+        (date_day > 0) && (date_month > 0) && (date_year >= 2000)) {
+        gps_apply_local_hour_offset(&date_year, &date_month, &date_day,
+                                    &utc_hour, APP_GPS_LOCAL_TIME_OFFSET_HOURS);
+        app_state.time_hour = (uint8_t)utc_hour;
+        app_state.time_minute = (uint8_t)utc_minute;
+        app_state.time_second = (uint8_t)utc_second;
+        app_state.time_day = (uint8_t)date_day;
+        app_state.time_month = (uint8_t)date_month;
+        app_state.time_year = (uint16_t)date_year;
+        LOG_INF("GPS RMC date: %04u-%02u-%02u", (unsigned int)app_state.time_year,
+                (unsigned int)app_state.time_month, (unsigned int)app_state.time_day);
+    }
+
     *plat = lat;
     *plon = lon;
     app_state.time_valid = true;
@@ -320,9 +366,29 @@ static void process_nmea_stream(uint8_t *buf, size_t len)
     }
 }
 
-static void gps_try_sync_system_time(void)
+static bool gps_try_sync_system_time(void)
 {
-	task_rtc_set_from_gps();
+    int ret = task_rtc_set_from_gps();
+    if (ret < 0) {
+        LOG_WRN("GPS->RTC sync failed: %d", ret);
+        return false;
+    }
+
+    uint32_t epoch = 0U;
+    ret = task_rtc_get_epoch_utc(&epoch);
+    if (ret < 0) {
+        LOG_WRN("RTC epoch read after GPS sync failed: %d", ret);
+        return false;
+    }
+
+    ret = retained_state_update_gps_sync(epoch);
+    if (ret < 0) {
+        LOG_WRN("Retained GPS sync epoch update failed: %d", ret);
+        return false;
+    }
+
+    LOG_INF("GPS sync epoch updated: %u", (unsigned int)epoch);
+    return true;
 }
 
 bool task_gps_acquire_for_uplink(void)
@@ -354,10 +420,10 @@ bool task_gps_acquire_for_uplink(void)
 		LOG_INF("GPS initialized for event trigger (I2C1 addr 0x%02x)", GPS_ADDR);
 	}
 
-	if (gps_en.port) {
-		gpio_pin_set_dt(&gps_en, 1);
-	}
-	k_msleep(120);
+	// if (gps_en.port) {
+	// 	gpio_pin_set_dt(&gps_en, 1);
+	// }
+	// k_msleep(120);
 
 	int ret;
 	task_i2c1_lock();
@@ -368,6 +434,8 @@ bool task_gps_acquire_for_uplink(void)
 		task_i2c1_lock();
 		(void)i2c_recover_bus(gps_i2c);
 		task_i2c1_unlock();
+		gps_power_off();
+		initialized = false;
 		gps_mark_failure(now, "i2c read failed");
 		return false;
 	}
@@ -387,7 +455,9 @@ bool task_gps_acquire_for_uplink(void)
 	if (app_state.gps_fix_count > old_fix_count) {
 		init_fail_count = 0U;
 		retry_deadline_ms = 0U;
-		gps_try_sync_system_time();
+        (void)task_storage_persist_gps_coords(app_state.gps_latitude,
+                              app_state.gps_longitude);
+        (void)gps_try_sync_system_time();
 		return true;
 	}
 
@@ -404,4 +474,40 @@ void task_gps_poll(void)
 void task_gps_prepare_sleep(void)
 {
 	gps_power_off();
+}
+
+bool task_gps_acquire_with_timeout(uint32_t timeout_ms, bool *rtc_synced)
+{
+    if (rtc_synced != NULL) {
+        *rtc_synced = false;
+    }
+
+    if (timeout_ms == 0U) {
+        return false;
+    }
+
+    uint32_t start_ms = k_uptime_get_32();
+    bool got_fix = false;
+
+    while ((k_uptime_get_32() - start_ms) < timeout_ms) {
+        task_watchdog_feed();
+
+        if (task_gps_acquire_for_uplink()) {
+            got_fix = true;
+            if (gps_try_sync_system_time() && (rtc_synced != NULL)) {
+                *rtc_synced = true;
+            }
+            break;
+        }
+
+        k_msleep(1000);
+    }
+
+    task_gps_prepare_sleep();
+
+    if (!got_fix) {
+        LOG_WRN("GPS timed acquisition timeout (%u ms)", (unsigned int)timeout_ms);
+    }
+
+    return got_fix;
 }

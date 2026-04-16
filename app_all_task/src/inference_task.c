@@ -5,9 +5,6 @@
 #include <zephyr/sys_clock.h>
 #include <zephyr/drivers/gpio.h>
 #include <string.h>
-#include <soc.h>
-#include <stm32_ll_pwr.h>
-#include <stm32_ll_rtc.h>
 
 LOG_MODULE_REGISTER(inference_task, LOG_LEVEL_INF);
 
@@ -28,7 +25,32 @@ LOG_MODULE_REGISTER(inference_task, LOG_LEVEL_INF);
 int32_t scale_number_t_int16_t(int32_t number, int scale_factor, round_mode_t round_mode);
 int16_t scale_and_clamp_to_number_t_int16_t(int32_t number, int scale_factor, round_mode_t round_mode);
 
-#include "ezbirdetect.h" /* Multiclass classifier cnn() and classifier_output_type */
+/* Undef macros defined by bird_detect_mfcc_model_floating.h that conflict with
+ * ezbirdetect.h. Both headers define NUMBER_T, OUTPUT_ROUND_MODE, etc. but may
+ * use different values. Undef all of them before including ezbirdetect.h.
+ */
+#undef NUMBER_T
+#undef LONG_NUMBER_T
+#undef OUTPUT_ROUND_MODE
+#undef WEIGHTS_SCALE_FACTOR
+#undef BIASES_SCALE_FACTOR
+#undef TMP_SCALE_FACTOR
+#undef INPUT_SCALE_FACTOR
+#undef OUTPUT_SCALE_FACTOR
+#undef INPUT_SAMPLES
+#undef FC_UNITS
+#undef ACTIVATION_LINEAR
+/* Suppress warnings from generated model code in ezbirdetect.h:
+ * - The cnn() signature uses input_t (float) but internally passes to stem_0()
+ *   which expects NUMBER_T (int16_t) — a mismatch in the generated code.
+ * - The -Wstringop-overflow is a false positive from GCC's analysis of the
+ *   generated model's fixed buffer sizes.
+ */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wincompatible-pointer-types"
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#include "ezbirdetect.h" /* Multiclass classifier: cnn(), classifier_output_type */
+#pragma GCC diagnostic pop
 
 int32_t scale_number_t_int16_t(int32_t number, int scale_factor, round_mode_t round_mode)
 {
@@ -81,9 +103,9 @@ static float32_t tmp[TMP_LEN];
 static arm_mfcc_instance_f32 instMFCC;
 
 /* CNN inputs and outputs */
-static input_t inputs; /* 186x9 */
+static input_t inputs; /* 186x9 float, used by detector and classifier */
 static dense_1_output_type outputs_detects; /* 2-class detector */
-static classifier_output_type outputs_class; /* 11-class classifier */
+static classifier_output_type outputs_class; /* 11-class classifier (float or int16 per config) */
 /* Running RMS statistics (reset after each successful uplink). */
 static float rms_accum = 0.0f;
 static uint32_t rms_count = 0U;
@@ -122,89 +144,14 @@ static uint32_t infer_session_id = 0U;
 static uint32_t infer_capture_start_ms = 0U;
 static volatile uint32_t infer_done_session_id = 0U;
 
-#define INFER_STATE_MAGIC            0xB17DU
-#define INFER_BKP_TOTAL              LL_RTC_BKP_DR2
-#define INFER_BKP_META               LL_RTC_BKP_DR3
-#define INFER_BKP_LABELS0            LL_RTC_BKP_DR4
-#define INFER_BKP_LABELS1            LL_RTC_BKP_DR5
-#define INFER_BKP_LABELS2            LL_RTC_BKP_DR6
-
-#if defined(CONFIG_SOC_SERIES_STM32U5X)
-#define INFER_RTC_SET_REG(rtc, reg, val) LL_RTC_BKP_SetRegister((rtc), (reg), (val))
-#define INFER_RTC_GET_REG(rtc, reg)      LL_RTC_BKP_GetRegister((rtc), (reg))
-#elif defined(CONFIG_SOC_SERIES_STM32L4X)
-#define INFER_RTC_SET_REG(rtc, reg, val) LL_RTC_BAK_SetRegister((rtc), (reg), (val))
-#define INFER_RTC_GET_REG(rtc, reg)      LL_RTC_BAK_GetRegister((rtc), (reg))
-#else
-#error "Unsupported STM32 series for RTC backup register API"
-#endif
-
-static void infer_persist_state(void)
+static void infer_reset_uplink_window_state(void)
 {
-	uint32_t labels_reg0 = 0U;
-	uint32_t labels_reg1 = 0U;
-	uint32_t labels_reg2 = 0U;
-	uint8_t count = app_state.infer_window_count;
-	uint8_t ready = app_state.infer_window_ready ? 1U : 0U;
-
-	for (int i = 0; i < 4; i++) {
-		labels_reg0 |= ((uint32_t)(uint8_t)app_state.infer_labels_window[i]) << (i * 8);
-		labels_reg1 |= ((uint32_t)(uint8_t)app_state.infer_labels_window[i + 4]) << (i * 8);
+	for (int i = 0; i < 10; i++) {
+		app_state.infer_labels_window[i] = -1;
 	}
-	for (int i = 0; i < 2; i++) {
-		labels_reg2 |= ((uint32_t)(uint8_t)app_state.infer_labels_window[i + 8]) << (i * 8);
-	}
-
-	LL_PWR_EnableBkUpAccess();
-    INFER_RTC_SET_REG(RTC, INFER_BKP_TOTAL, app_state.infer_total_count);
-    INFER_RTC_SET_REG(RTC, INFER_BKP_META,
-			       ((uint32_t)INFER_STATE_MAGIC << 16) |
-			       ((uint32_t)ready << 8) |
-			       (uint32_t)count);
-    INFER_RTC_SET_REG(RTC, INFER_BKP_LABELS0, labels_reg0);
-    INFER_RTC_SET_REG(RTC, INFER_BKP_LABELS1, labels_reg1);
-    INFER_RTC_SET_REG(RTC, INFER_BKP_LABELS2, labels_reg2);
-}
-
-static void infer_restore_state(void)
-{
-	uint32_t meta;
-	LL_PWR_EnableBkUpAccess();
-    meta = INFER_RTC_GET_REG(RTC, INFER_BKP_META);
-	if ((meta >> 16) != INFER_STATE_MAGIC) {
-		for (int i = 0; i < 10; i++) {
-			app_state.infer_labels_window[i] = -1;
-		}
-		app_state.infer_window_count = 0U;
-		app_state.infer_window_ready = false;
-		app_state.infer_total_count = 0U;
-		infer_persist_state();
-		return;
-	}
-
-    app_state.infer_total_count = INFER_RTC_GET_REG(RTC, INFER_BKP_TOTAL);
-	app_state.infer_window_count = (uint8_t)(meta & 0xFFU);
-	app_state.infer_window_ready = (((meta >> 8) & 0x01U) != 0U);
-
-    uint32_t labels_reg0 = INFER_RTC_GET_REG(RTC, INFER_BKP_LABELS0);
-    uint32_t labels_reg1 = INFER_RTC_GET_REG(RTC, INFER_BKP_LABELS1);
-    uint32_t labels_reg2 = INFER_RTC_GET_REG(RTC, INFER_BKP_LABELS2);
-	for (int i = 0; i < 4; i++) {
-		app_state.infer_labels_window[i] = (int8_t)((labels_reg0 >> (i * 8)) & 0xFFU);
-		app_state.infer_labels_window[i + 4] = (int8_t)((labels_reg1 >> (i * 8)) & 0xFFU);
-	}
-	for (int i = 0; i < 2; i++) {
-		app_state.infer_labels_window[i + 8] = (int8_t)((labels_reg2 >> (i * 8)) & 0xFFU);
-	}
-
-	if (app_state.infer_window_count > 10U) {
-		app_state.infer_window_count = 10U;
-	}
-
-	LOG_INF("Inference state restored: total=%u window_count=%u ready=%u",
-		(unsigned int)app_state.infer_total_count,
-		(unsigned int)app_state.infer_window_count,
-		(unsigned int)(app_state.infer_window_ready ? 1U : 0U));
+	app_state.infer_window_count = 0U;
+	app_state.infer_window_ready = false;
+	app_state.infer_total_count = 0U;
 }
 
 static void mfcc_work_handler(struct k_work *work)
@@ -305,15 +252,18 @@ static void mfcc_work_handler(struct k_work *work)
                 uint32_t cls_start_ms = k_uptime_get_32();
                 LOG_DBG("PIPE_EVT,session=%u,evt=classifier,phase=start",
                         (unsigned int)infer_session_id);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
                 cnn(inputs, outputs_class);
+#pragma GCC diagnostic pop
                 cls_ms_u32 = k_uptime_get_32() - cls_start_ms;
                 LOG_DBG("PIPE_EVT,session=%u,evt=classifier,phase=end,dur_ms=%u",
                         (unsigned int)infer_session_id, (unsigned int)cls_ms_u32);
                 int best = 0;
-                float best_val = outputs_class[0];
+                float best_val = (float)outputs_class[0];
                 for (int i = 1; i < 11; i++) {
-                    if (outputs_class[i] > best_val) {
-                        best_val = outputs_class[i];
+                    if ((float)outputs_class[i] > best_val) {
+                        best_val = (float)outputs_class[i];
                         best = i;
                     }
                 }
@@ -345,7 +295,6 @@ static void mfcc_work_handler(struct k_work *work)
         }
         LOG_INF("Inference state updated: label=%d total=%u",
                 label, (unsigned int)app_state.infer_total_count);
-        infer_persist_state();
 
         uint32_t series_ms = k_uptime_get_32() - series_start_ms;
         uint32_t capture_to_done_ms = 0U;
@@ -407,7 +356,7 @@ int task_inference_init(void)
     rms_count = 0U;
     app_state.infer_last_rms = 0.0f;
     app_state.infer_avg_rms = 0.0f;
-    infer_restore_state();
+    infer_reset_uplink_window_state();
     k_work_init(&mfcc_work, mfcc_work_handler);
     /* Start dedicated inference workqueue */
     k_work_queue_start(&infer_wq, infer_wq_stack,
@@ -545,13 +494,7 @@ void task_inference_reset_periodic_stats(void)
 
 void task_inference_consume_uplink_window(void)
 {
-	app_state.infer_window_ready = false;
-	app_state.infer_window_count = 0U;
-	app_state.infer_total_count = 0U;
-	for (int i = 0; i < 10; i++) {
-		app_state.infer_labels_window[i] = -1;
-	}
-	infer_persist_state();
+	infer_reset_uplink_window_state();
 	LOG_INF("Inference uplink window consumed: counters reset");
 }
 

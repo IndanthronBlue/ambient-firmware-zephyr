@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <ff.h>
 #include <string.h>
+#include <stdlib.h>
 
 LOG_MODULE_REGISTER(storage_task, LOG_LEVEL_INF);
 
@@ -42,6 +43,8 @@ static uint32_t pcm_write_total_ms = 0U;
 static uint32_t pcm_write_max_ms = 0U;
 static uint32_t storage_session_id = 0U;
 static const char *storage_unsynced_dir = "/SD:/unsynced";
+#define STORAGE_DEV_EUI_PATH "/SD:/dev.txt"
+#define STORAGE_GPS_COORDS_PATH "/SD:/gps.txt"
 
 void task_storage_set_session_id(uint32_t session_id)
 {
@@ -153,6 +156,58 @@ static int init_sd_controller(void)
 	}
 	LOG_INF("SDHC device ready");
 	return 0;
+}
+
+static struct k_work_delayable sd_mount_work;
+static int sd_mount_retry_count = 0;
+static bool sd_mount_work_inited = false;
+#define SD_MOUNT_MAX_RETRIES 5
+
+static void sd_mount_worker(struct k_work *work);
+
+static void task_sd_mount_async_init_once(void)
+{
+	if (sd_mount_work_inited) {
+		return;
+	}
+
+	k_work_init_delayable(&sd_mount_work, sd_mount_worker);
+	sd_mount_work_inited = true;
+}
+
+static void sd_mount_worker(struct k_work *work)
+{
+	if (app_state.sd_mounted) {
+		return;
+	}
+
+	if (sd_mount_retry_count >= SD_MOUNT_MAX_RETRIES) {
+		LOG_WRN("Background SD mount failed after %d attempts, giving up for this ACTIVE period", SD_MOUNT_MAX_RETRIES);
+		return;
+	}
+
+	sd_mount_retry_count++;
+	LOG_INF("Background SD mount attempt %d/%d...", sd_mount_retry_count, SD_MOUNT_MAX_RETRIES);
+	task_sd_mount();
+
+	if (!app_state.sd_mounted && (sd_mount_retry_count < SD_MOUNT_MAX_RETRIES)) {
+		/* 挂载失败，1秒后重试 */
+		k_work_reschedule(&sd_mount_work, K_MSEC(1000));
+	}
+}
+
+void task_sd_mount_async(void)
+{
+	task_sd_mount_async_init_once();
+	sd_mount_retry_count = 0; // 每个 ACTIVE 周期重置计数器
+	k_work_reschedule(&sd_mount_work, K_NO_WAIT);
+}
+
+void task_sd_mount_async_cancel(void)
+{
+	task_sd_mount_async_init_once();
+	(void)k_work_cancel_delayable(&sd_mount_work);
+	sd_mount_retry_count = 0;
 }
 
 void task_sd_mount(void)
@@ -302,6 +357,11 @@ static bool storage_get_rtc_time(struct rtc_time *tm)
 		return false;
 	}
 
+	if (!task_rtc_time_is_real(tm)) {
+		LOG_INF("RTC still uses default/uninitialized seed, using default unsynced folder");
+		return false;
+	}
+
 	LOG_INF("RTC time read: %04d-%02d-%02d %02d:%02d:%02d UTC",
 		tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
 		tm->tm_hour, tm->tm_min, tm->tm_sec);
@@ -309,33 +369,243 @@ static bool storage_get_rtc_time(struct rtc_time *tm)
 	return true;
 }
 
-static bool storage_rtc_time_is_sane(const struct rtc_time *tm)
+static bool storage_dev_eui_is_valid(const uint8_t dev_eui[8])
 {
-	if (tm == NULL) {
+	bool all_zero = true;
+	bool all_ff = true;
+
+	for (size_t i = 0; i < 8U; i++) {
+		if (dev_eui[i] != 0U) {
+			all_zero = false;
+		}
+		if (dev_eui[i] != 0xFFU) {
+			all_ff = false;
+		}
+	}
+
+	return !all_zero && !all_ff;
+}
+
+static int storage_hex_nibble(char c)
+{
+	if (c >= '0' && c <= '9') {
+		return c - '0';
+	}
+	if (c >= 'a' && c <= 'f') {
+		return c - 'a' + 10;
+	}
+	if (c >= 'A' && c <= 'F') {
+		return c - 'A' + 10;
+	}
+	return -1;
+}
+
+static bool storage_parse_dev_eui_text(const char *text, uint8_t out_dev_eui[8])
+{
+	if (text == NULL || out_dev_eui == NULL) {
 		return false;
 	}
 
-	if (tm->tm_sec < 0 || tm->tm_sec > 59) {
-		return false;
+	uint8_t parsed[8] = {0};
+	int hi_nibble = -1;
+	size_t out_i = 0U;
+
+	for (const char *p = text; *p != '\0'; ++p) {
+		int nib = storage_hex_nibble(*p);
+		if (nib < 0) {
+			continue;
+		}
+
+		if (hi_nibble < 0) {
+			hi_nibble = nib;
+		} else {
+			if (out_i >= 8U) {
+				return false;
+			}
+			parsed[out_i++] = (uint8_t)((hi_nibble << 4) | nib);
+			hi_nibble = -1;
+		}
 	}
-	if (tm->tm_min < 0 || tm->tm_min > 59) {
-		return false;
-	}
-	if (tm->tm_hour < 0 || tm->tm_hour > 23) {
-		return false;
-	}
-	if (tm->tm_mday < 1 || tm->tm_mday > 31) {
-		return false;
-	}
-	if (tm->tm_mon < 0 || tm->tm_mon > 11) {
+
+	if (hi_nibble >= 0 || out_i != 8U) {
 		return false;
 	}
 
-	int year = tm->tm_year + 1900;
-	if (year < 700 || year > 2099) {
+	if (!storage_dev_eui_is_valid(parsed)) {
 		return false;
 	}
 
+	memcpy(out_dev_eui, parsed, 8U);
+	return true;
+}
+
+static void storage_format_dev_eui_text(const uint8_t dev_eui[8], char *out, size_t out_sz)
+{
+	(void)snprintk(out, out_sz,
+		"%02X %02X %02X %02X %02X %02X %02X %02X\n",
+		dev_eui[0], dev_eui[1], dev_eui[2], dev_eui[3],
+		dev_eui[4], dev_eui[5], dev_eui[6], dev_eui[7]);
+}
+
+task_storage_status_t task_storage_persist_dev_eui(const uint8_t dev_eui[8])
+{
+	if (dev_eui == NULL || !storage_dev_eui_is_valid(dev_eui)) {
+		return TASK_STORAGE_STATUS_INVALID_ARG;
+	}
+
+	if (!app_state.sd_mounted) {
+		return TASK_STORAGE_STATUS_NOT_MOUNTED;
+	}
+
+	struct fs_file_t file;
+	fs_file_t_init(&file);
+
+	int ret = fs_open(&file, STORAGE_DEV_EUI_PATH, FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
+	if (ret != 0) {
+		if (ret == -ENODEV || ret == -EIO) {
+			storage_note_sd_io_lost(ret);
+		}
+		return TASK_STORAGE_STATUS_IO_ERROR;
+	}
+
+	char line[32];
+	storage_format_dev_eui_text(dev_eui, line, sizeof(line));
+	size_t line_len = strnlen(line, sizeof(line));
+	ret = fs_write(&file, line, line_len);
+	(void)fs_close(&file);
+
+	if (ret < 0 || (size_t)ret != line_len) {
+		if (ret == -ENODEV || ret == -EIO) {
+			storage_note_sd_io_lost(ret);
+		}
+		return TASK_STORAGE_STATUS_IO_ERROR;
+	}
+
+	LOG_INF("Persisted DevEUI to %s", STORAGE_DEV_EUI_PATH);
+	return TASK_STORAGE_STATUS_OK;
+}
+
+bool task_storage_load_dev_eui(uint8_t dev_eui[8])
+{
+	if (dev_eui == NULL || !app_state.sd_mounted) {
+		return false;
+	}
+
+	struct fs_file_t file;
+	fs_file_t_init(&file);
+
+	int ret = fs_open(&file, STORAGE_DEV_EUI_PATH, FS_O_READ);
+	if (ret != 0) {
+		return false;
+	}
+
+	char buf[96];
+	ret = fs_read(&file, buf, sizeof(buf) - 1U);
+	(void)fs_close(&file);
+	if (ret <= 0) {
+		return false;
+	}
+	buf[ret] = '\0';
+
+	if (!storage_parse_dev_eui_text(buf, dev_eui)) {
+		return false;
+	}
+
+	LOG_INF("Loaded DevEUI from %s", STORAGE_DEV_EUI_PATH);
+	return true;
+}
+
+task_storage_status_t task_storage_persist_gps_coords(float latitude, float longitude)
+{
+	if ((latitude < -90.0f) || (latitude > 90.0f) ||
+	    (longitude < -180.0f) || (longitude > 180.0f)) {
+		return TASK_STORAGE_STATUS_INVALID_ARG;
+	}
+
+	if (!app_state.sd_mounted) {
+		return TASK_STORAGE_STATUS_NOT_MOUNTED;
+	}
+
+	struct fs_file_t file;
+	fs_file_t_init(&file);
+
+	int ret = fs_open(&file, STORAGE_GPS_COORDS_PATH, FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
+	if (ret != 0) {
+		if (ret == -ENODEV || ret == -EIO) {
+			storage_note_sd_io_lost(ret);
+		}
+		return TASK_STORAGE_STATUS_IO_ERROR;
+	}
+
+	char line[64];
+	int len = snprintk(line, sizeof(line), "%.7f,%.7f\n", (double)latitude, (double)longitude);
+	if (len <= 0) {
+		(void)fs_close(&file);
+		return TASK_STORAGE_STATUS_IO_ERROR;
+	}
+
+	ret = fs_write(&file, line, (size_t)len);
+	(void)fs_close(&file);
+	if (ret < 0 || ret != len) {
+		if (ret == -ENODEV || ret == -EIO) {
+			storage_note_sd_io_lost(ret);
+		}
+		return TASK_STORAGE_STATUS_IO_ERROR;
+	}
+
+	return TASK_STORAGE_STATUS_OK;
+}
+
+bool task_storage_load_gps_coords(float *latitude, float *longitude)
+{
+	if (latitude == NULL || longitude == NULL || !app_state.sd_mounted) {
+		return false;
+	}
+
+	struct fs_file_t file;
+	fs_file_t_init(&file);
+
+	int ret = fs_open(&file, STORAGE_GPS_COORDS_PATH, FS_O_READ);
+	if (ret != 0) {
+		return false;
+	}
+
+	char buf[96];
+	ret = fs_read(&file, buf, sizeof(buf) - 1U);
+	(void)fs_close(&file);
+	if (ret <= 0) {
+		return false;
+	}
+	buf[ret] = '\0';
+
+	char *p = buf;
+	char *end = NULL;
+	float lat = strtof(p, &end);
+	if (end == p) {
+		return false;
+	}
+
+	while (*end == ' ' || *end == '\t' || *end == ',') {
+		end++;
+	}
+
+	p = end;
+	float lon = strtof(p, &end);
+	if (end == p) {
+		return false;
+	}
+
+	if ((lat < -90.0f) || (lat > 90.0f) ||
+	    (lon < -180.0f) || (lon > 180.0f)) {
+		return false;
+	}
+
+	if ((lat == 0.0f) && (lon == 0.0f)) {
+		return false;
+	}
+
+	*latitude = lat;
+	*longitude = lon;
 	return true;
 }
 
@@ -466,7 +736,7 @@ task_storage_status_t task_storage_pcm_begin(char *out_path, size_t out_sz)
 
 	struct rtc_time tm;
 	struct rtc_time *tm_ptr = NULL;
-	if (storage_get_rtc_time(&tm) && storage_rtc_time_is_sane(&tm)) {
+	if (storage_get_rtc_time(&tm)) {
 		tm_ptr = &tm;
 	} else {
 		LOG_INF("RTC not ready or not synced yet, using default unsynced folder");
@@ -655,6 +925,7 @@ void task_status_persist(void)
 
 void task_storage_prepare_sleep(void)
 {
+	task_sd_mount_async_cancel();
 	task_storage_pcm_end();
 
 	if (!app_state.sd_mounted) {

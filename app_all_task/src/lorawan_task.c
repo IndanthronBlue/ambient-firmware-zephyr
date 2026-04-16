@@ -7,6 +7,7 @@
 #include <zephyr/device.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/lorawan/lorawan.h>
+#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/sys/byteorder.h>
 #include <errno.h>
 #include <string.h>
@@ -32,6 +33,7 @@ static uint8_t app_key[]  = { 0x60, 0x3F, 0x36, 0x36, 0xA0, 0x39, 0x26, 0xAB, 0x
 
 static bool lorawan_stack_started;
 static bool lorawan_session_joined;
+static bool dev_eui_initialized;
 static int64_t next_join_deadline;
 static uint32_t init_fail_count;
 static uint8_t confirmed_fail_streak;
@@ -39,6 +41,108 @@ static uint16_t last_dev_nonce;
 static uint32_t devnonce_prng_state;
 
 static struct lorawan_downlink_cb downlink_cb;
+
+static bool lorawan_dev_eui_is_valid(const uint8_t eui[8])
+{
+	bool all_zero = true;
+	bool all_ff = true;
+
+	for (size_t i = 0; i < 8U; i++) {
+		if (eui[i] != 0U) {
+			all_zero = false;
+		}
+		if (eui[i] != 0xFFU) {
+			all_ff = false;
+		}
+	}
+
+	return !all_zero && !all_ff;
+}
+
+static void lorawan_log_dev_eui(const char *tag, const uint8_t eui[8])
+{
+	LOG_INF("%s DevEUI: %02X %02X %02X %02X %02X %02X %02X %02X",
+		tag,
+		eui[0], eui[1], eui[2], eui[3],
+		eui[4], eui[5], eui[6], eui[7]);
+}
+
+static uint64_t lorawan_crc64_ecma(const uint8_t *data, size_t len)
+{
+	uint64_t crc = 0ULL;
+	const uint64_t poly = 0x42F0E1EBA9EA3693ULL;
+
+	for (size_t i = 0; i < len; i++) {
+		crc ^= ((uint64_t)data[i] << 56);
+		for (int bit = 0; bit < 8; bit++) {
+			if (crc & 0x8000000000000000ULL) {
+				crc = (crc << 1) ^ poly;
+			} else {
+				crc <<= 1;
+			}
+		}
+	}
+
+	return crc;
+}
+
+static int lorawan_generate_dev_eui_from_hwid(uint8_t out_eui[8])
+{
+	uint8_t hwid[32];
+	ssize_t hwid_len = hwinfo_get_device_id(hwid, sizeof(hwid));
+	if (hwid_len <= 0) {
+		LOG_WRN("hwinfo_get_device_id failed (%d)", (int)hwid_len);
+		return -ENODATA;
+	}
+
+	uint64_t derived = lorawan_crc64_ecma(hwid, (size_t)hwid_len);
+	memcpy(out_eui, &derived, sizeof(derived));
+
+	/* Locally administered bit set; keep deterministic per-device. */
+	out_eui[0] |= 0x02U;
+
+	if (!lorawan_dev_eui_is_valid(out_eui)) {
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static void lorawan_init_dev_eui_once(void)
+{
+	if (dev_eui_initialized) {
+		(void)task_storage_persist_dev_eui(dev_eui);
+		return;
+	}
+
+	if (task_storage_load_dev_eui(dev_eui) && lorawan_dev_eui_is_valid(dev_eui)) {
+		lorawan_log_dev_eui("Loaded", dev_eui);
+		dev_eui_initialized = true;
+		return;
+	}
+
+	if (lorawan_generate_dev_eui_from_hwid(dev_eui) == 0) {
+		lorawan_log_dev_eui("Generated", dev_eui);
+		dev_eui_initialized = true;
+		(void)task_storage_persist_dev_eui(dev_eui);
+		return;
+	}
+
+	if (!lorawan_dev_eui_is_valid(dev_eui)) {
+		/* Last-resort fallback keeps old hardcoded value if generation failed. */
+		dev_eui[0] = 0xB2;
+		dev_eui[1] = 0x21;
+		dev_eui[2] = 0x56;
+		dev_eui[3] = 0xAD;
+		dev_eui[4] = 0xAD;
+		dev_eui[5] = 0x8A;
+		dev_eui[6] = 0x4F;
+		dev_eui[7] = 0xF2;
+	}
+	lorawan_log_dev_eui("Fallback", dev_eui);
+	dev_eui_initialized = true;
+	(void)task_storage_persist_dev_eui(dev_eui);
+}
 
 static uint16_t lorawan_random_devnonce(void)
 {
@@ -118,6 +222,8 @@ static int lorawan_start_stack(void)
 {
 	const struct device *lora_dev = DEVICE_DT_GET(DT_NODELABEL(lora));
 	int ret;
+
+	lorawan_init_dev_eui_once();
 
 	if (!device_is_ready(lora_dev)) {
 		LOG_ERR("SX126x radio not ready");
@@ -419,9 +525,24 @@ int task_lorawan_connect(void)
 
 void task_lorawan_prepare_sleep(void)
 {
-	/* No explicit low-power API in current Zephyr LoRaWAN layer.
-	 * Radio/peripherals are power-cycled through v_periph domain.
+	/* The SX126x sits on the v_periph power domain.
+	 * Once suspend powers v_periph off, the radio loses its runtime state
+	 * and any previously joined LoRaWAN session is no longer valid from the
+	 * application's point of view. If we keep lorawan_stack_started /
+	 * lorawan_session_joined set, the next uplink path will try to transmit
+	 * using a stale stack+radio state and can hit McpsRequest Tx timeout.
+	 *
+	 * Force a clean stack restart and OTAA rejoin after every power-cycle of
+	 * the radio domain.
 	 */
-	LOG_INF("LoRaWAN prepare sleep: relying on v_periph power-off");
+	if (lorawan_stack_started || lorawan_session_joined) {
+		LOG_INF("LoRaWAN prepare sleep: invalidate stack/session after v_periph power-off");
+	}
+
+	lorawan_stack_started = false;
+	lorawan_session_joined = false;
+	app_state.lorawan_joined = false;
+	confirmed_fail_streak = 0U;
+	next_join_deadline = k_uptime_get();
 }
 

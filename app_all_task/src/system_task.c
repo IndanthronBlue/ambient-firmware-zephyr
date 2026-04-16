@@ -11,7 +11,7 @@ LOG_MODULE_REGISTER(system_task, LOG_LEVEL_INF);
 #include "tasks.h"
 
 #define WATCHDOG_TIMEOUT_MS 24000U
-#define WATCHDOG_FEED_PERIOD_MS 2000U
+#define WATCHDOG_FEED_PERIOD_MS 10000U
 /* Optional periodic reboot for long-term field stability; 0 disables. */
 #define SOFT_REBOOT_PERIOD_MS 0U
 

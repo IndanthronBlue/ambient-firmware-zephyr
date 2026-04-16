@@ -6,6 +6,7 @@
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/pm/policy.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -13,6 +14,8 @@ LOG_MODULE_REGISTER(microphone_task, LOG_LEVEL_INF);
 
 #include "ADC3101.h"
 #include "tasks.h"
+
+int codec_adc3101_init(void);
 
 /* DT user node for custom properties (optional) */
 #define ZEPHYR_USER_NODE DT_NODELABEL(zephyr_user)
@@ -42,8 +45,9 @@ static const struct device *const i2s_dev = DEVICE_DT_GET(SAI1B_NODE);
 #define MIC_APP_BLOCK_SIZE      (MIC_BYTES_PER_SAMPLE * MIC_APP_SAMPLES_PER_BLOCK)
 #define MIC_BLOCK_COUNT         6
 #define MIC_IO_TIMEOUT_MS       200
-#define MIC_RING_BLOCK_COUNT    5
-#define MIC_PIPELINE_WAIT_MS    3000
+#define MIC_RING_BLOCK_COUNT    30
+#define MIC_PIPELINE_WAIT_MS        5000
+#define MIC_INFERENCE_WAIT_TIMEOUT_MS 10000U
 
 /* RX memory slab for I2S driver (blocks owned by driver and passed to app) */
 K_MEM_SLAB_DEFINE_STATIC(mic_rx_slab, MIC_CAPTURE_BLOCK_SIZE, MIC_BLOCK_COUNT, 4);
@@ -63,7 +67,7 @@ K_SEM_DEFINE(mic_sd_sem, 0, 1024);
 static struct k_thread mic_infer_thread_data;
 static struct k_thread mic_sd_thread_data;
 K_THREAD_STACK_DEFINE(mic_infer_thread_stack, 1024);
-K_THREAD_STACK_DEFINE(mic_sd_thread_stack, 1536);
+K_THREAD_STACK_DEFINE(mic_sd_thread_stack, 4096);
 static bool mic_pipeline_workers_started = false;
 static atomic_t mic_pipeline_active = ATOMIC_INIT(0);
 static atomic_t mic_pipeline_producer_done = ATOMIC_INIT(0);
@@ -80,6 +84,67 @@ static uint32_t mic_ring_sd_fail_count;
 static inline uint32_t mic_min_u32(uint32_t a, uint32_t b)
 {
 	return (a < b) ? a : b;
+}
+
+static int mic_configure_i2s_rx(void)
+{
+	struct i2s_config rx_cfg = {0};
+	rx_cfg.word_size = MIC_SAMPLE_BIT_WIDTH;
+	rx_cfg.channels = MIC_CAPTURE_CHANNELS;
+	rx_cfg.format = I2S_FMT_DATA_FORMAT_I2S;
+	/* MCU provides BCLK/LRCK as master; bit clock continuous */
+	rx_cfg.options = I2S_OPT_BIT_CLK_MASTER | I2S_OPT_FRAME_CLK_MASTER | I2S_OPT_BIT_CLK_CONT;
+	rx_cfg.frame_clk_freq = MIC_SAMPLE_FREQUENCY;
+	rx_cfg.mem_slab = &mic_rx_slab;
+	rx_cfg.block_size = MIC_CAPTURE_BLOCK_SIZE;
+	rx_cfg.timeout = MIC_IO_TIMEOUT_MS;
+
+	int ret = i2s_configure(i2s_dev, I2S_DIR_RX, &rx_cfg);
+	if (ret < 0) {
+		LOG_ERR("i2s_configure RX failed: %d", ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int mic_full_rx_recover(void)
+{
+	int ret;
+
+	LOG_WRN("Mic RX full recover: stop/drop + codec/i2s reconfigure");
+
+	/* Always attempt STOP then DROP regardless of current state;
+	 * ignore errors since the stream may already be in error/ready state.
+	 */
+	(void)i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_STOP);
+	(void)i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_DROP);
+
+	/* Full codec re-init: re-programs all registers and waits for PLL lock.
+	 * This is necessary because HAL_SAI_InitProtocol requires a clean HAL
+	 * state, and the ADC3101 PLL needs ~50ms to stabilise before SAI DMA
+	 * can be started successfully.
+	 */
+	ret = codec_adc3101_init();
+	if (ret < 0) {
+		LOG_ERR("Codec re-init failed in recover: %d", ret);
+		return ret;
+	}
+
+	/* Re-configure the SAI/I2S peripheral after codec is ready. */
+	ret = mic_configure_i2s_rx();
+	if (ret < 0) {
+		LOG_ERR("I2S reconfigure failed in recover: %d", ret);
+		return ret;
+	}
+
+	/* Extra settling time: ADC3101 PLL needs time to lock to MCLK before
+	 * the first DMA transfer can succeed. Without this delay
+	 * HAL_SAI_Receive_DMA fails immediately (-EIO / -5).
+	 */
+	k_msleep(80);
+
+	return 0;
 }
 
 static void mic_pipeline_reset_state(void)
@@ -184,6 +249,8 @@ static void mic_sd_consumer_thread(void *a, void *b, void *c)
 	enum { MIC_SD_BLOCKS_PER_CHUNK = 2 };
 	static int16_t mic_sd_chunk_buf[MIC_SD_BLOCKS_PER_CHUNK * MIC_APP_SAMPLES_PER_BLOCK];
 	uint32_t chunk_fill_blocks = 0U;
+	bool pcm_file_initialized = false;
+	char path[64] = {0};
 
 	while (1) {
 		k_sem_take(&mic_sd_sem, K_FOREVER);
@@ -211,21 +278,14 @@ static void mic_sd_consumer_thread(void *a, void *b, void *c)
 
 			if (!has_data) {
 				/* No more ring data: if producer finished, flush tail chunk. */
-				if (!active && producer_done && chunk_fill_blocks > 0U) {
-					size_t bytes = (size_t)chunk_fill_blocks * MIC_APP_BLOCK_SIZE;
-					atomic_inc(&sd_write_inflight);
-					task_storage_status_t st = task_storage_pcm_write(mic_sd_chunk_buf, bytes);
-					atomic_dec(&sd_write_inflight);
-					if (st != TASK_STORAGE_STATUS_OK &&
-					    st != TASK_STORAGE_STATUS_NOT_OPEN &&
-					    st != TASK_STORAGE_STATUS_NOT_MOUNTED) {
-						k_mutex_lock(&mic_ring_lock, K_FOREVER);
-						mic_ring_sd_fail_count++;
-						k_mutex_unlock(&mic_ring_lock);
-					}
-					chunk_fill_blocks = 0U;
-				}
 				if (!active && producer_done) {
+					if (chunk_fill_blocks > 0U && pcm_file_initialized) {
+						size_t bytes = (size_t)chunk_fill_blocks * MIC_APP_BLOCK_SIZE;
+						atomic_inc(&sd_write_inflight);
+						(void)task_storage_pcm_write(mic_sd_chunk_buf, bytes);
+						atomic_dec(&sd_write_inflight);
+					}
+					pcm_file_initialized = false;
 					break;
 				}
 				if (!active) {
@@ -234,20 +294,38 @@ static void mic_sd_consumer_thread(void *a, void *b, void *c)
 				break;
 			}
 
-			/* Once we have a full chunk, write it in one call. */
+			/* 一旦有全块，尝试写入。 */
 			if (chunk_fill_blocks >= MIC_SD_BLOCKS_PER_CHUNK) {
+				/* 如果文件还没打开，说明是该次录音的第一块，先等待挂载并 Begin */
+				if (!pcm_file_initialized) {
+					while (atomic_get(&mic_pipeline_active) && !app_state.sd_mounted) {
+						k_msleep(100); // 等待后台挂载线程成功
+					}
+
+					if (app_state.sd_mounted) {
+						task_storage_status_t storage_status = task_storage_pcm_begin(path, sizeof(path));
+						if (storage_status == TASK_STORAGE_STATUS_OK) {
+							pcm_file_initialized = true;
+							LOG_INF("SD catch-up: background file opened at %s", path);
+						} else {
+							LOG_WRN("SD catch-up: pcm_begin failed (%d), dropping blocks", (int)storage_status);
+							chunk_fill_blocks = 0U;
+							continue;
+						}
+					} else {
+						/* 录音已结束但SD仍未挂载，丢弃该块 */
+						chunk_fill_blocks = 0U;
+						continue;
+					}
+				}
+
+				/* 执行写入 */
 				atomic_inc(&sd_write_inflight);
 				task_storage_status_t st = task_storage_pcm_write(mic_sd_chunk_buf,
 									 (size_t)MIC_SD_BLOCKS_PER_CHUNK * MIC_APP_BLOCK_SIZE);
 				atomic_dec(&sd_write_inflight);
 				chunk_fill_blocks = 0U;
-				if (st == TASK_STORAGE_STATUS_OK ||
-				    st == TASK_STORAGE_STATUS_NOT_OPEN ||
-				    st == TASK_STORAGE_STATUS_NOT_MOUNTED) {
-					/* No-SD mode: keep pipeline moving, just skip writes. */
-					continue;
-				}
-				{
+				if (st != TASK_STORAGE_STATUS_OK) {
 					k_mutex_lock(&mic_ring_lock, K_FOREVER);
 					mic_ring_sd_fail_count++;
 					k_mutex_unlock(&mic_ring_lock);
@@ -293,56 +371,59 @@ int codec_adc3101_init(void)
 		return -ENODEV;
 	}
 
-	/* Recover I2C bus and allow codec/power rail settle time. */
-	int r = i2c_recover_bus(i2c2_dev);
-	if (r) {
-		LOG_WRN("i2c_recover_bus failed before ADC3101 init: %d", r);
-	}
-	k_msleep(ADC3101_RESET_DELAY_MS);
+	/* 移除重复的等待延迟，由电源使能端统一控制 */
+	// k_msleep(ADC3101_RESET_DELAY_MS);
 
 	/* Address is fixed by hardware strap on this board. */
 	const uint8_t adc_addr = ADC3101_ADDR00;
 	adc3101_init(i2c2_dev, adc_addr);
-	k_msleep(30);
+	k_msleep(80);
 
-	int ack = -EIO;
-	for (int attempt = 1; attempt <= 30; attempt++) {
-		ack = adc3101_read(0x00);
-		if (ack >= 0) {
-			break;
-		}
-		/* Do sparse recover to avoid shaking the bus repeatedly. */
-		if (attempt == 6 || attempt == 16) {
-			(void)i2c_recover_bus(i2c2_dev);
-			k_msleep(10);
-		}
-		k_msleep((attempt < 10) ? 20 : 40);
-	}
-	if (ack < 0) {
-		LOG_ERR("ADC3101 no ACK at fixed address 0x%02x", (unsigned int)adc_addr);
-		return -ENODEV;
-	}
-	LOG_INF("ADC3101 ACK at 0x%02x (reg0=0x%02x)",
-		(unsigned int)adc_addr, (unsigned int)ack);
+	// int ack = -EIO;
+	// for (int attempt = 1; attempt <= 30; attempt++) {
+	// 	ack = adc3101_read(0x00);
+	// 	if (ack >= 0) {
+	// 		break;
+	// 	}
+	// 	/* Do sparse recover to avoid shaking the bus repeatedly. */
+	// 	if (attempt == 6 || attempt == 16) {
+	// 		task_i2c2_lock();
+	// 		(void)i2c_recover_bus(i2c2_dev);
+	// 		task_i2c2_unlock();
+	// 		k_msleep(10);
+	// 	}
+	// 	k_msleep((attempt < 10) ? 20 : 40);
+	// }
+	// if (ack < 0) {
+	// 	LOG_ERR("ADC3101 no ACK at fixed address 0x%02x", (unsigned int)adc_addr);
+	// 	return -ENODEV;
+	// }
+	// LOG_INF("ADC3101 ACK at 0x%02x (reg0=0x%02x)",
+	// 	(unsigned int)adc_addr, (unsigned int)ack);
 
-	/* Perform setup and verify via a simple readback with limited retries */
-	int rd = -1;
-	for (int attempt = 1; attempt <= 3; attempt++) {
-		adc3101_setup();
-		/* Verify a known register (word length cfg at 0x1B) */
-		rd = adc3101_read(0x1B);
-		if (rd >= 0) {
-			LOG_INF("ADC3101 setup verified: reg 0x1B = 0x%02x", rd);
-			break;
-		}
-		LOG_WRN("ADC3101 verify attempt %d failed: %d", attempt, rd);
-		(void)i2c_recover_bus(i2c2_dev);
-		k_msleep(50);
-	}
-	if (rd < 0) {
-		LOG_ERR("ADC3101 setup verification failed after retries");
-		return -EIO;
-	}
+	// /* Perform setup and verify via a simple readback with limited retries */
+	// int rd = -1;
+	// for (int attempt = 1; attempt <= 3; attempt++) {
+	// 	adc3101_setup();
+	// 	/* Verify a known register (word length cfg at 0x1B) */
+	// 	rd = adc3101_read(0x1B);
+	// 	if (rd >= 0) {
+	// 		LOG_INF("ADC3101 setup verified: reg 0x1B = 0x%02x", rd);
+	// 		break;
+	// 	}
+	// 	LOG_WRN("ADC3101 verify attempt %d failed: %d", attempt, rd);
+	// 	task_i2c2_lock();
+	// 	(void)i2c_recover_bus(i2c2_dev);
+	// 	task_i2c2_unlock();
+	// 	k_msleep(50);
+	// }
+	// if (rd < 0) {
+	// 	LOG_ERR("ADC3101 setup verification failed after retries");
+	// 	return -EIO;
+	// }
+	task_i2c2_lock();
+	adc3101_setup();
+	task_i2c2_unlock();
 	LOG_INF("ADC3101 configured at 0x%02x (I2S 16-bit, PRB_P1)", (unsigned int)adc_addr);
 	return 0;
 }
@@ -350,8 +431,20 @@ int codec_adc3101_init(void)
 /* ===== Mic/I2S Init ===== */
 int task_microphone_init(void)
 {
+	int ret;
+
 	if (mic_initialized) {
-		mic_sleep_prepared = false;
+		if (mic_sleep_prepared) {
+			/* 从 SUSPEND 恢复：外设电源刚恢复，必须重写 Codec 寄存器 */
+			LOG_INF("Mic resuming: re-initializing codec only");
+			ret = codec_adc3101_init();
+			if (ret < 0) {
+				mic_initialized = false;
+				return ret;
+			}
+			mic_sleep_prepared = false;
+			k_msleep(80);
+		}
 		return 0;
 	}
 
@@ -360,37 +453,31 @@ int task_microphone_init(void)
 		return -ENODEV;
 	}
 
-	int ret = codec_adc3101_init();
+	ret = codec_adc3101_init();
 	if (ret < 0) {
 		return ret;
 	}
 
-	struct i2s_config rx_cfg = {0};
-	rx_cfg.word_size = MIC_SAMPLE_BIT_WIDTH;
-	rx_cfg.channels = MIC_CAPTURE_CHANNELS;
-	rx_cfg.format = I2S_FMT_DATA_FORMAT_I2S;
-	/* MCU provides BCLK/LRCK as master; bit clock continuous */
-	rx_cfg.options = I2S_OPT_BIT_CLK_MASTER | I2S_OPT_FRAME_CLK_MASTER | I2S_OPT_BIT_CLK_CONT;
-	rx_cfg.frame_clk_freq = MIC_SAMPLE_FREQUENCY;
-	rx_cfg.mem_slab = &mic_rx_slab;
-	rx_cfg.block_size = MIC_CAPTURE_BLOCK_SIZE;
-	rx_cfg.timeout = MIC_IO_TIMEOUT_MS;
-
-	ret = i2s_configure(i2s_dev, I2S_DIR_RX, &rx_cfg);
-	k_msleep(1000);
+	/* 仅在全局第一次初始化时配置 I2S 硬件寄存器 */
+	ret = mic_configure_i2s_rx();
 	if (ret < 0) {
-		LOG_ERR("i2s_configure RX failed: %d", ret);
 		return ret;
 	}
 
-	LOG_INF("I2S RX configured: %u Hz, %u-bit, %u-ch(capture), capture block %u bytes, app block %u bytes",
-			MIC_SAMPLE_FREQUENCY, MIC_SAMPLE_BIT_WIDTH, MIC_CAPTURE_CHANNELS,
-			(unsigned)MIC_CAPTURE_BLOCK_SIZE, (unsigned)MIC_APP_BLOCK_SIZE);
+	LOG_INF("I2S RX configured: %u Hz, %u-bit, %u-ch(capture)",
+			MIC_SAMPLE_FREQUENCY, MIC_SAMPLE_BIT_WIDTH, MIC_CAPTURE_CHANNELS);
 	mic_initialized = true;
 	mic_sleep_prepared = false;
 	/* Keep V3.0 capture flow, but initialize inference pipeline. */
 	(void)task_inference_init();
 	mic_pipeline_workers_start_once();
+
+	/* ADC3101 PLL requires time to lock to MCLK after power-up/init.
+	 * Without this delay the very first HAL_SAI_Receive_DMA call fails
+	 * (-EIO) because the codec has not yet started outputting a valid
+	 * I2S clock on its SD line.
+	 */
+	k_msleep(80);
 
 	return 0;
 }
@@ -411,8 +498,6 @@ void task_microphone_trigger_recording(void)
 
 void task_microphone_prepare_sleep(void)
 {
-	int ret;
-
 	mic_sleep_prepared = true;
 	atomic_set(&mic_pipeline_active, 0);
 	atomic_set(&mic_pipeline_producer_done, 1);
@@ -425,35 +510,35 @@ void task_microphone_prepare_sleep(void)
 		return;
 	}
 
-	ret = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_STOP);
-	if (ret < 0 && ret != -EIO) {
-		LOG_WRN("RX STOP before sleep failed: %d", ret);
-	}
-
-	ret = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_PREPARE);
-	if (ret < 0 && ret != -EIO) {
-		LOG_WRN("RX PREPARE before sleep failed: %d", ret);
-	}
-
-	ret = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_DROP);
-	if (ret < 0 && ret != -EIO) {
-		LOG_WRN("RX DROP before sleep failed: %d", ret);
-	}
+	/* 停止 DMA 传输，保持 I2S 配置寄存器 */
+	(void)i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_STOP);
+	(void)i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_DROP);
 }
 
 /* ===== Perform single 3s capture to SD card ===== */
 void task_microphone_capture_once(void)
 {
+	int ret;
+	bool resumed_from_sleep = mic_sleep_prepared;
     LOG_INF("task_microphone_capture_once called");
 	/* Preconditions */
 	if (mic_sleep_prepared) {
-		LOG_WRN("Mic capture blocked: sleep preparation active");
-		return;
+		/* 调用 init 逻辑来恢复 Codec 而不重复配置 I2S */
+		(void)task_microphone_init();
 	}
 	if (!mic_initialized) {
         LOG_WRN("Mic not initialized; cannot capture");
 		return;
 	}
+
+#if IS_ENABLED(CONFIG_PM)
+	/* Prevent CPU from entering STOP (suspend-to-idle) during the entire
+	 * capture session. STM32 STOP mode gates PLL2 which feeds SAI1; if
+	 * the CPU enters STOP while SAI DMA is running the DMA completion
+	 * interrupt never fires and every i2s_read() times out.
+	 */
+	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+#endif
 	// if (!app_state.mic_record_request || app_state.mic_recording) {
     //     LOG_WRN("Recording already in progress or not requested");
 	// 	return;
@@ -462,58 +547,66 @@ void task_microphone_capture_once(void)
 	capture_session_id++;
 	task_storage_set_session_id(capture_session_id);
 
-	/* SD can be transiently lost during an active window; re-check before each capture. */
-	task_sd_ensure_mounted();
-
-	bool sd_write_enabled = false;
-	char path[64] = {0};
-
-	/* SD card is optional: capture + inference continues even if SD is absent. */
-	if (app_state.sd_mounted) {
-		/* Open timestamped PCM file via storage task wrapper. */
-		task_storage_status_t storage_status = task_storage_pcm_begin(path, sizeof(path));
-		if (storage_status == TASK_STORAGE_STATUS_OK) {
-			sd_write_enabled = true;
-			LOG_INF("Start recording to %s (3s)", path);
-		} else {
-			if (storage_status == TASK_STORAGE_STATUS_NO_SPACE) {
-				LOG_WRN("SD write disabled: free space not enough");
-			} else if (storage_status == TASK_STORAGE_STATUS_CAPACITY_UNAVAILABLE) {
-				LOG_WRN("SD write disabled: cannot read SD capacity");
-			} else if (storage_status == TASK_STORAGE_STATUS_NOT_MOUNTED) {
-				LOG_WRN("SD write disabled: SD not mounted");
-			} else {
-				LOG_WRN("SD write disabled: storage begin failed (status=%d)", (int)storage_status);
-			}
-		}
-	} else {
-		LOG_WRN("SD not mounted; capture+inference will continue without SD write");
-	}
-
-	if (!sd_write_enabled) {
-		LOG_INF("Start capture+inference (3s), SD write skipped");
-	}
+	/* SD card is optional: capture + inference continues even if SD is absent.
+	 * The background consumer thread will wait for SD mount and call pcm_begin asynchronously.
+	 */
 	app_state.mic_recording = true;
 	bool rx_started = false;
 	bool rx_error = false;
+	bool capture_complete = false;
+	int blocks_written = 0;
 	mic_pipeline_reset_state();
 	uint32_t capture_start_ms = k_uptime_get_32();
 	task_inference_session_begin(capture_session_id, capture_start_ms);
 
+	/* Reset RX queue/state before every fresh session.
+	 * Do not unconditionally PREPARE here: STM32 SAI reports invalid state
+	 * in the normal READY path after suspend/resume, and that correlates with
+	 * the first-session all-zero blocks. DROP is enough to bring the queue
+	 * back to READY for a normal fresh START.
+	 */
+	ret = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_DROP);
+	if (ret < 0 && ret != -EIO) {
+		LOG_WRN("i2s_trigger DROP RX before START failed: %d", ret);
+	}
+
+	if (resumed_from_sleep) {
+		/* Give codec/SAI data path a little extra settling time right after
+		 * suspend resume to reduce first-session all-zero capture blocks.
+		 */
+		LOG_INF("resumed_from_sleep, sleeping for 100ms");
+		k_msleep(600);
+	}
+
 	/* Start RX stream */
-	int ret = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_START);
+	ret = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_START);
 	if (ret < 0) {
-		LOG_ERR("i2s_trigger START RX failed: %d", ret);
-		goto done_close;
+		LOG_WRN("i2s_trigger START RX failed: %d, trying full recover", ret);
+		ret = mic_full_rx_recover();
+		if (ret < 0) {
+			LOG_ERR("Full recover before START failed: %d", ret);
+			goto done_close;
+		}
+		/* After full recover the SAI HAL state is clean; PREPARE+DROP
+		 * are not needed again since mic_full_rx_recover() already
+		 * called STOP+DROP and re-ran HAL_SAI_InitProtocol.
+		 */
+		ret = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_START);
+		if (ret < 0) {
+			LOG_ERR("i2s_trigger START RX failed after full recover: %d", ret);
+			goto done_close;
+		}
 	}
 	rx_started = true;
 	LOG_INF("I2S RX stream started");
+	// adc3101_resume();
 	LOG_INF("PIPE_EVT,session=%u,evt=capture,phase=start",
 		(unsigned int)capture_session_id);
 
 	/* 3 seconds at 100ms per block -> 30 blocks */
 	const int blocks_target = 30;
-	int blocks_written = 0;
+	bool rx_restarted_once = false;
+	bool rx_full_recovered_once = false;
 
 	int rx_timeouts = 0;
 	while (blocks_written < blocks_target) {
@@ -524,7 +617,39 @@ void task_microphone_capture_once(void)
 			rx_timeouts++;
 			LOG_WRN("i2s RX timeout (no data), count=%d", rx_timeouts);
 			if (rx_timeouts >= 10) {
+				if (!rx_restarted_once) {
+					LOG_WRN("RX timeout burst, trying one-time RX restart");
+					(void)i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_STOP);
+					(void)i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_DROP);
+					k_msleep(10);
+					ret = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_START);
+					if (ret == 0) {
+						rx_restarted_once = true;
+						rx_timeouts = 0;
+						continue;
+					}
+					LOG_ERR("RX restart failed after timeout burst: %d", ret);
+				}
+
+				if (!rx_full_recovered_once) {
+					LOG_WRN("RX timeout burst, trying one-time full recover");
+					ret = mic_full_rx_recover();
+					if (ret == 0) {
+						ret = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_START);
+						if (ret == 0) {
+							rx_full_recovered_once = true;
+							rx_restarted_once = true;
+							rx_timeouts = 0;
+							continue;
+						}
+						LOG_ERR("START failed after full recover: %d", ret);
+					} else {
+						LOG_ERR("Full recover failed after timeout burst: %d", ret);
+					}
+				}
+
 				LOG_ERR("No RX data after repeated timeouts, aborting");
+				rx_error = true;
 				break;
 			}
 			continue;
@@ -534,6 +659,7 @@ void task_microphone_capture_once(void)
 			break;
 		}
 		LOG_DBG("i2s_buf_read got block of size %u bytes", (unsigned)sz);
+		rx_timeouts = 0;
 
 		if (sz == 0 || rx_mem_block == NULL) {
 			if (rx_mem_block != NULL) {
@@ -610,13 +736,6 @@ void task_microphone_capture_once(void)
 			}
 		}
 
-		if (rx_error || stop_ret < 0) {
-			int prep_ret = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_PREPARE);
-			if (prep_ret < 0) {
-				LOG_WRN("PREPARE RX failed: %d", prep_ret);
-			}
-		}
-
 		(void)i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_DROP);
 	}
 
@@ -626,6 +745,7 @@ void task_microphone_capture_once(void)
 		(unsigned int)capture_session_id,
 		blocks_written,
 		(unsigned int)(k_uptime_get_32() - capture_start_ms));
+	capture_complete = (!rx_error) && (blocks_written >= blocks_target);
 
 done_close:
 	if (atomic_get(&mic_pipeline_active) || !atomic_get(&mic_pipeline_producer_done)) {
@@ -642,26 +762,43 @@ done_close:
 	app_state.mic_recording = false;
 	app_state.mic_record_request = false;
 
-	/* Showcase timing: wait briefly for final MFCC+model series to finish. */
-	bool infer_done = task_inference_wait_series_done(capture_session_id, 20000U);
 	uint32_t capture_total_ms = k_uptime_get_32() - capture_start_ms;
-	if (!infer_done) {
-		LOG_WRN("Timing summary: inference series not finished within timeout (session=%u)",
+	if (!capture_complete) {
+		LOG_WRN("Capture incomplete (%d/%d blocks), skip inference wait for session=%u",
+			blocks_written,
+			blocks_target,
 			(unsigned int)capture_session_id);
 	} else {
-		LOG_INF("Pipeline summary: capture_total=%ums session=%u",
-			(unsigned int)capture_total_ms, (unsigned int)capture_session_id);
-		LOG_INF("MFCC chunk ms: [%u %u %u %u %u %u] det=%u cls=%u mfcc6+model=%u capture->done=%u",
-			(unsigned int)app_state.infer_mfcc_chunk_ms[0],
-			(unsigned int)app_state.infer_mfcc_chunk_ms[1],
-			(unsigned int)app_state.infer_mfcc_chunk_ms[2],
-			(unsigned int)app_state.infer_mfcc_chunk_ms[3],
-			(unsigned int)app_state.infer_mfcc_chunk_ms[4],
-			(unsigned int)app_state.infer_mfcc_chunk_ms[5],
-			(unsigned int)app_state.infer_detector_ms,
-			(unsigned int)app_state.infer_classifier_ms,
-			(unsigned int)app_state.infer_mfcc_series_ms,
-			(unsigned int)app_state.infer_capture_to_done_ms);
+		bool infer_done = false;
+		uint32_t infer_wait_start_ms = k_uptime_get_32();
+
+		while ((k_uptime_get_32() - infer_wait_start_ms) < MIC_INFERENCE_WAIT_TIMEOUT_MS) {
+			if (task_inference_wait_series_done(capture_session_id, 1000U)) {
+				infer_done = true;
+				break;
+			}
+			task_watchdog_feed();
+		}
+
+		if (!infer_done) {
+			LOG_WRN("Inference wait timeout for session=%u after %u ms",
+				(unsigned int)capture_session_id,
+				(unsigned int)MIC_INFERENCE_WAIT_TIMEOUT_MS);
+		} else {
+			LOG_INF("Pipeline summary: capture_total=%ums session=%u",
+				(unsigned int)capture_total_ms, (unsigned int)capture_session_id);
+			LOG_INF("MFCC chunk ms: [%u %u %u %u %u %u] det=%u cls=%u mfcc6+model=%u capture->done=%u",
+				(unsigned int)app_state.infer_mfcc_chunk_ms[0],
+				(unsigned int)app_state.infer_mfcc_chunk_ms[1],
+				(unsigned int)app_state.infer_mfcc_chunk_ms[2],
+				(unsigned int)app_state.infer_mfcc_chunk_ms[3],
+				(unsigned int)app_state.infer_mfcc_chunk_ms[4],
+				(unsigned int)app_state.infer_mfcc_chunk_ms[5],
+				(unsigned int)app_state.infer_detector_ms,
+				(unsigned int)app_state.infer_classifier_ms,
+				(unsigned int)app_state.infer_mfcc_series_ms,
+				(unsigned int)app_state.infer_capture_to_done_ms);
+		}
 	}
 	LOG_INF("SD write time: blocks=%u total=%uB total_cost=%ums max=%ums avg=%ums last_block=%ums (enabled_now=%u)",
 		(unsigned int)app_state.sd_pcm_blocks,
@@ -671,4 +808,11 @@ done_close:
 		(unsigned int)app_state.sd_pcm_avg_ms,
 		(unsigned int)app_state.sd_pcm_last_block_ms,
 		(unsigned int)(app_state.sd_pcm_write_enabled ? 1U : 0U));
+
+#if IS_ENABLED(CONFIG_PM)
+	/* Release the STOP-mode lock acquired at the start of capture.
+	 * From this point the PM subsystem is free to enter STOP again.
+	 */
+	pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+#endif
 }

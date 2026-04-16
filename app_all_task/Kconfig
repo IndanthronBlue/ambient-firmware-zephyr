@@ -1,0 +1,80 @@
+mainmenu "app_all_task"
+
+source "Kconfig.zephyr"
+
+menu "app_all_task feature switches"
+
+config APP_LOW_POWER_FSM
+	bool "Enable low-power FSM framework"
+	default n
+	help
+	  Enable low-power state-machine integration paths.
+
+config APP_DEEP_SLEEP_ENABLE
+	bool "Enable deep-sleep entry paths"
+	default n
+	help
+	  Enable real deep-sleep/standby entry logic.
+
+config APP_RETENTION_ENABLE
+	bool "Enable retained RAM features"
+	default n
+	help
+	  Enable retained RAM based state persistence.
+
+config APP_DEEP_SLEEP_SIMULATE
+	bool "Simulate deep sleep for debug"
+	default n
+	help
+	  Keep low-power flow testable on platforms where true standby is
+	  unavailable during bring-up.
+
+menu "Wakeup source switches"
+
+config APP_WAKEUP_SRC_BUTTON
+	bool "Enable button wakeup source"
+	default y
+	help
+	  Allow button IRQ to wake the power FSM.
+
+config APP_WAKEUP_SRC_PERIODIC
+	bool "Enable periodic wakeup source"
+	default y
+	help
+	  Allow periodic timer window to wake the power FSM.
+
+config APP_WAKEUP_SRC_COMM
+	bool "Enable comm wakeup source"
+	default y
+	help
+	  Allow communication requests to wake the power FSM.
+
+config APP_WAKEUP_SRC_RTC_ALARM
+	bool "Enable RTC alarm wakeup source"
+	default y
+	help
+	  Allow RTC alarm callback to wake the power FSM.
+
+config APP_WAKEUP_SRC_SOUND
+	bool "Enable sound IRQ wakeup source"
+	default y
+	help
+	  Allow external sound IRQ to wake the power FSM.
+
+config APP_WAKEUP_SRC_LOW_BAT
+	bool "Enable low-battery wakeup source"
+	default y
+	help
+	  Allow low-battery event to force transition into deep sleep.
+
+config APP_GPS_LOCAL_TIME_OFFSET_HOURS
+	int "GPS local time offset from UTC (hours)"
+	default 2
+	range -12 14
+	help
+	  Local time offset applied to GPS UTC time before programming RTC.
+	  France typically uses 1 in winter and 2 in summer (DST).
+
+endmenu
+
+endmenu

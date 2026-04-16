@@ -14,7 +14,7 @@ LOG_MODULE_REGISTER(adc3101, LOG_LEVEL_INF);
 /* Internal state */
 static const struct device *s_i2c = NULL;
 static uint8_t s_addr = ADC3101_ADDR00;
-static bool s_debug = false; /* default off */
+static bool s_debug __attribute__((unused)) = false; /* default off */
 static uint32_t s_last_recover_ms = 0U;
 
 static bool is_recoverable_i2c_error(int ret)
@@ -46,8 +46,10 @@ int adc3101_write(uint8_t reg, uint8_t val)
     }
 
     uint8_t buf[2] = {reg, val};
+    task_i2c2_lock();
     int ret = i2c_write(s_i2c, buf, sizeof(buf), s_addr);
     if (ret == 0) {
+        task_i2c2_unlock();
         LOG_DBG("I2C write ok: addr=0x%02x reg=0x%02x val=0x%02x", s_addr, reg, val);
         return 0;
     }
@@ -56,6 +58,7 @@ int adc3101_write(uint8_t reg, uint8_t val)
     if (is_recoverable_i2c_error(ret) && adc3101_should_recover_now()) {
         int rec = i2c_recover_bus(s_i2c);
         if (rec != 0) {
+            task_i2c2_unlock();
             LOG_WRN("I2C recover after write failed: %d", rec);
             return ret;
         }
@@ -63,6 +66,7 @@ int adc3101_write(uint8_t reg, uint8_t val)
         ret = i2c_write(s_i2c, buf, sizeof(buf), s_addr);
     }
 
+    task_i2c2_unlock();
     return ret;
 }
 
@@ -73,8 +77,10 @@ int adc3101_read(uint8_t reg)
     }
 
     uint8_t val = 0;
+    task_i2c2_lock();
     int ret = i2c_write_read(s_i2c, s_addr, &reg, 1, &val, 1);
     if (ret == 0) {
+        task_i2c2_unlock();
         LOG_DBG("I2C read ok: addr=0x%02x reg=0x%02x val=0x%02x", s_addr, reg, val);
         return (int)val;
     }
@@ -83,17 +89,20 @@ int adc3101_read(uint8_t reg)
     if (is_recoverable_i2c_error(ret) && adc3101_should_recover_now()) {
         int rec = i2c_recover_bus(s_i2c);
         if (rec != 0) {
+            task_i2c2_unlock();
             LOG_WRN("I2C recover after read failed: %d", rec);
             return ret;
         }
         k_msleep(5);
         ret = i2c_write_read(s_i2c, s_addr, &reg, 1, &val, 1);
         if (ret == 0) {
+            task_i2c2_unlock();
             LOG_DBG("I2C read ok after recover: addr=0x%02x reg=0x%02x val=0x%02x", s_addr, reg, val);
             return (int)val;
         }
     }
 
+    task_i2c2_unlock();
     return ret;
 }
 
@@ -127,6 +136,98 @@ static int adc3101_write_retry(uint8_t reg, uint8_t val, int retries, int delay_
 }
 
 void adc3101_setup(void)
+{
+    /* 1. Define starting point */
+    LOG_DBG("1. Define starting point:");
+    LOG_DBG("Set register page to 0");
+    (void)adc3101_write(0x00, 0x00);
+    k_msleep(10);
+
+    /* Software reset */
+    LOG_DBG("Initiate software reset");
+    (void)adc3101_write(0x01, 0x01);
+    k_msleep(20);
+
+    /* 2. Program Clock Settings */
+    LOG_DBG("2. Program Clock Settings");
+    LOG_DBG("ADC_CLKIN = MCLK, P=1, R=1, J=4, D=0000");
+    (void)adc3101_write(0x04, 0x00); /* CODEC_CLKIN = MCLK */
+    (void)adc3101_write(0x05, 0x11); /* PLL power down, P=1, R=1 */
+    (void)adc3101_write(0x06, 0x04); /* J=4 */
+    (void)adc3101_write(0x07, 0x00); /* D MSB */
+    (void)adc3101_write(0x08, 0x00); /* D LSB */
+
+    /* NADC/MADC/AOSR */
+    LOG_DBG("Program and power up NADC: NADC = 1, divider powered on");
+    int ok_nadc = adc3101_write(0x12, 0x81);
+
+    LOG_DBG("Program and power up MADC: MADC = 2, divider powered on");
+    int ok_madc = adc3101_write(0x13, 0x82);
+
+    LOG_DBG("Program OSR value: AOSR = 128");
+    int ok_aosr = adc3101_write(0x14, 0x80);
+
+    LOG_DBG("Program I2S wordlength: 16-bit, slave mode");
+    (void)adc3101_write(0x1B, 0x00);
+
+    LOG_DBG("Program the processing block to be used: PRB_P1");
+    (void)adc3101_write(0x3D, 0x01);
+    k_msleep(10);
+
+    /* 3. Program Analog Blocks */
+    LOG_DBG("3. Program Analog Blocks");
+    LOG_DBG("Set register Page to 1");
+    (void)adc3101_write(0x00, 0x01);
+    k_msleep(10);
+
+    LOG_DBG("Program MICBIAS: MICBIAS1 = 3.3V, MICBIAS2 = 3.3V");
+    (void)adc3101_write(0x33, 0b01111000); /* 3.3V */
+
+    LOG_INF("Program MicPGA: Left/Right = %udB", ADC3101_MICPGA_GAIN_DB);
+    (void)adc3101_write(0x3b, (uint8_t)(ADC3101_MICPGA_GAIN_DB * 2U));
+    (void)adc3101_write(0x3c, (uint8_t)(ADC3101_MICPGA_GAIN_DB * 2U));
+
+    LOG_DBG("Input selection: IN1L/IN1R as Single-Ended");
+    (void)adc3101_write(0x34, 0b00111111); /* Left ADC input selection */
+    (void)adc3101_write(0x37, 0b00111111); /* Right ADC input selection */
+
+    /* 4. Program ADC */
+    LOG_DBG("4. Program ADC");
+    LOG_DBG("Set register Page to 0");
+    (void)adc3101_write(0x00, 0x00);
+    k_msleep(10);
+
+    LOG_DBG("Power up ADC channels");
+    if (ok_nadc != 0 || ok_madc != 0 || ok_aosr != 0) {
+        LOG_WRN("NADC/MADC/AOSR writes had errors; proceeding to power-up to avoid RX stall");
+    }
+    (void)adc3101_write(0x51, 0xc2);
+    k_msleep(10);
+
+    LOG_DBG("Unmute digital volume control and set gain = 0 dB");
+    (void)adc3101_write(0x52, 0b00000000);
+
+    LOG_DBG("Set left/right ADC volume control = %u dB", ADC3101_ADC_DIGITAL_GAIN_DB);
+    (void)adc3101_write(0x53, (uint8_t)(ADC3101_ADC_DIGITAL_GAIN_DB * 2U));
+    (void)adc3101_write(0x54, (uint8_t)(ADC3101_ADC_DIGITAL_GAIN_DB * 2U));
+
+#if 1 /* High-pass filter */
+    LOG_DBG("5. Program filters");
+    LOG_DBG("Set register Page to 4");
+    (void)adc3101_write(0x00, 0x04);
+    k_msleep(10);
+
+    /* 30Hz high-pass Butterworth 1st order 0dB */
+    (void)adc3101_write(8, 0x7F);  /* N0 MSB */
+    (void)adc3101_write(9, 0x3F);  /* N0 LSB */
+    (void)adc3101_write(10, 0x80); /* N1 MSB */
+    (void)adc3101_write(11, 0xC1); /* N1 LSB */
+    (void)adc3101_write(12, 0x7E); /* D1 MSB */
+    (void)adc3101_write(13, 0x7F); /* D1 LSB */
+#endif
+}
+
+void adc3101_setup_slow(void)
 {
     /* 1. Define starting point */
     LOG_DBG("1. Define starting point:");
@@ -216,4 +317,32 @@ void adc3101_setup(void)
     (void)adc3101_write_retry(12, 0x7E, 8, 5, true); /* D1 MSB */
     (void)adc3101_write_retry(13, 0x7F, 8, 5, true); /* D1 LSB */
 #endif
+}
+
+void adc3101_suspend(void)
+{
+    /* 切回 Page 0 */
+    (void)adc3101_write(0x00, 0x00);
+    /* 左右通道静音 */
+    (void)adc3101_write(0x52, 0x88);
+    /* 关闭 L/R ADC 电源 (Power down) */
+    (void)adc3101_write(0x51, 0x02); 
+    LOG_INF("Codec ADC powered down (Soft Suspend)");
+}
+
+void adc3101_resume(void)
+{
+    /* 切回 Page 0 */
+    (void)adc3101_write(0x00, 0x00);
+    /* 重新给 L/R ADC 上电 (恢复 0xC2) */
+    (void)adc3101_write(0x51, 0xc2);
+    /* ADC3101 internal PLL must lock to MCLK before it can output valid
+     * I2S BCLK/LRCK/SD.  The datasheet specifies PLL lock time up to
+     * ~10 ms; add extra margin to cover MCLK startup jitter and avoid
+     * HAL_SAI_Receive_DMA failing immediately after resume.
+     */
+    k_msleep(50);
+    /* 解除静音，恢复数字增益为 0dB */
+    (void)adc3101_write(0x52, 0x00);
+    LOG_INF("Codec ADC powered up (Soft Resume)");
 }
