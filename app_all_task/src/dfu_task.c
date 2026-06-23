@@ -26,6 +26,11 @@ LOG_MODULE_REGISTER(dfu_task, LOG_LEVEL_INF);
 static bool dfu_checked_once;
 static uint8_t dfu_read_buf[DFU_READ_CHUNK_SIZE];
 
+enum dfu_check_origin {
+	DFU_CHECK_ORIGIN_BOOT,
+	DFU_CHECK_ORIGIN_ACTIVE_EXIT,
+};
+
 /**
  * @brief 获取升级文件大小并做基础类型检查。
  *
@@ -204,46 +209,50 @@ static void dfu_mark_update_file_consumed(void)
 	}
 }
 
-/**
- * @brief 启动阶段执行一次 SD 卡离线升级检查与触发。
- *
- * 设计目标：
- * - 仅在单次启动周期内执行一次（`dfu_checked_once`）；
- * - 只依赖 Zephyr 官方 FS/Flash/MCUboot API；
- * - 在检测到有效升级文件后，自动写入 Slot1 并请求 MCUboot 升级。
- *
- * 执行流程：
- * 1. 确保 SD 已挂载；未挂载则直接跳过。
- * 2. 检查 `/SD:/update.bin` 是否存在且大小有效。
- * 3. 打开 Slot1 并校验文件大小不超过分区容量。
- * 4. 调用写入函数将镜像分块写入 Slot1。
- * 5. 调用 `boot_request_upgrade(BOOT_UPGRADE_TEST)` 请求测试升级。
- * 6. 清理升级文件（重命名/删除），随后冷重启。
- *
- * 说明：
- * - 该函数不做镜像签名验证，最终验签由 MCUboot 在启动阶段完成。
- * - 若任一步失败，仅记录日志并返回，不触发重启。
- */
-void task_dfu_check_and_apply(void)
+static const char *dfu_check_origin_name(enum dfu_check_origin origin)
+{
+	switch (origin) {
+	case DFU_CHECK_ORIGIN_BOOT:
+		return "boot";
+	case DFU_CHECK_ORIGIN_ACTIVE_EXIT:
+		return "active-exit";
+	default:
+		return "unknown";
+	}
+}
+
+static void dfu_check_and_apply_common(enum dfu_check_origin origin, bool allow_mount)
 {
 	const struct flash_area *slot1;
 	size_t update_size = 0U;
 	int ret;
 
-	if (dfu_checked_once) {
+	if (allow_mount) {
+		task_sd_ensure_mounted();
+	} else if (!app_state.sd_mounted) {
+		LOG_DBG("DFU skipped (%s): SD card not mounted",
+			dfu_check_origin_name(origin));
 		return;
 	}
-	dfu_checked_once = true;
 
-	task_sd_ensure_mounted();
 	if (!app_state.sd_mounted) {
-		LOG_INF("DFU skipped: SD card not mounted");
+		if (origin == DFU_CHECK_ORIGIN_BOOT) {
+			LOG_INF("DFU skipped (%s): SD card not mounted",
+				dfu_check_origin_name(origin));
+		} else {
+			LOG_DBG("DFU skipped (%s): SD card not mounted",
+				dfu_check_origin_name(origin));
+		}
 		return;
 	}
 
 	ret = dfu_get_update_file_size(DFU_UPDATE_FILE_PATH, &update_size);
 	if (ret == -ENOENT) {
-		LOG_INF("DFU: no %s in SD root", DFU_UPDATE_FILE_PATH);
+		if (origin == DFU_CHECK_ORIGIN_BOOT) {
+			LOG_INF("DFU: no %s in SD root", DFU_UPDATE_FILE_PATH);
+		} else {
+			LOG_DBG("DFU: no %s in SD root", DFU_UPDATE_FILE_PATH);
+		}
 		return;
 	}
 	if (ret != 0) {
@@ -271,8 +280,8 @@ void task_dfu_check_and_apply(void)
 
 	flash_area_close(slot1);
 
-	LOG_INF("DFU: found update image %u bytes, writing to image-1",
-		(unsigned int)update_size);
+	LOG_INF("DFU: found update image %u bytes during %s, writing to image-1",
+		(unsigned int)update_size, dfu_check_origin_name(origin));
 
 	ret = dfu_copy_file_to_image_1(DFU_UPDATE_FILE_PATH, update_size);
 	if (ret != 0) {
@@ -280,8 +289,7 @@ void task_dfu_check_and_apply(void)
 		return;
 	}
 
-	// ret = boot_request_upgrade(BOOT_UPGRADE_TEST);
-    ret = boot_request_upgrade(BOOT_UPGRADE_PERMANENT);
+	ret = boot_request_upgrade(BOOT_UPGRADE_PERMANENT);
 	if (ret != 0) {
 		LOG_ERR("DFU: boot_request_upgrade failed: %d", ret);
 		return;
@@ -291,4 +299,45 @@ void task_dfu_check_and_apply(void)
 	LOG_INF("DFU: upgrade requested (PERMANENT), rebooting now");
 	LOG_PANIC();
 	sys_reboot(SYS_REBOOT_COLD);
+}
+
+/**
+ * @brief 启动阶段执行一次 SD 卡离线升级检查与触发。
+ *
+ * 设计目标：
+ * - 仅在单次启动周期内执行一次（`dfu_checked_once`）；
+ * - 只依赖 Zephyr 官方 FS/Flash/MCUboot API；
+ * - 在检测到有效升级文件后，自动写入 Slot1 并请求 MCUboot 升级。
+ *
+ * 执行流程：
+ * 1. 确保 SD 已挂载；未挂载则直接跳过。
+ * 2. 检查 `/SD:/update.bin` 是否存在且大小有效。
+ * 3. 打开 Slot1 并校验文件大小不超过分区容量。
+ * 4. 调用写入函数将镜像分块写入 Slot1。
+ * 5. 调用 `boot_request_upgrade(BOOT_UPGRADE_PERMANENT)` 请求永久升级。
+ * 6. 清理升级文件（重命名/删除），随后冷重启。
+ *
+ * 说明：
+ * - 该函数不做镜像签名验证，最终验签由 MCUboot 在启动阶段完成。
+ * - 若任一步失败，仅记录日志并返回，不触发重启。
+ */
+void task_dfu_check_and_apply(void)
+{
+	if (dfu_checked_once) {
+		return;
+	}
+	dfu_checked_once = true;
+
+	dfu_check_and_apply_common(DFU_CHECK_ORIGIN_BOOT, false);
+}
+
+/**
+ * @brief ACTIVE 周期结束时执行的可重复 SD 卡 DFU 检查。
+ *
+ * 该入口不受 `dfu_checked_once` 限制，用于维护人员在设备运行期间
+ * 放入 `/SD:/update.bin` 后，等待当前 ACTIVE 周期结束自动触发升级。
+ */
+void task_dfu_check_and_apply_periodic(void)
+{
+	dfu_check_and_apply_common(DFU_CHECK_ORIGIN_ACTIVE_EXIT, false);
 }
