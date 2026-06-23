@@ -35,7 +35,7 @@ with the private key that matches the public key compiled into MCUboot.
 The current project uses Zephyr `4.3.99`. You can check it in the workspace:
 
 ```bash
-cat /home/jzhang/zephyrproject/zephyr/VERSION
+cat /home/usr_name/zephyrproject/zephyr/VERSION
 ```
 
 ## Purpose and Feature Overview
@@ -180,18 +180,18 @@ private keys to the repository.
 
 ### Build Environment
 
-The commands below assume the Zephyr workspace is `/home/jzhang/zephyrproject`
+The commands below assume the Zephyr workspace is `/home/usr_name/zephyrproject`
 and this repository is
-`/home/jzhang/zephyrproject/git/ambient-firmware-zephyr`.
+`/home/usr_name/zephyrproject/git/ambient-firmware-zephyr`.
 
 ```bash
-cd /home/jzhang/zephyrproject
+cd /home/usr_name/zephyrproject
 source .venv/bin/activate
 
-REPO=/home/jzhang/zephyrproject/git/ambient-firmware-zephyr
-KEY=/home/jzhang/zephyrproject/keys/bird-mcuboot-ec256.pem
+REPO=/home/usr_name/zephyrproject/git/ambient-firmware-zephyr
+KEY=/home/usr_name/zephyrproject/keys/bird-mcuboot-ec256.pem
 MCUBOOT_CONF=$REPO/app_all_task/mcuboot_bird_ec256.conf
-STM32_CLI=/home/jzhang/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI
+STM32_CLI=/home/usr_name/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI
 ```
 
 Check tools and key:
@@ -272,16 +272,10 @@ west build -p always \
   -- -DBOARD_ROOT=$REPO -DDTS_ROOT=$REPO/app_all_task
 ```
 
-#### 5. Sign the application
+#### 5. Use the auto-signed application image
 
-```bash
-west sign -d build_app_u5 -t imgtool -- \
-  --key $KEY \
-  --overwrite-only \
-  --align 1
-```
-
-Use the generated signed files:
+`app_all_task/prj.conf` disables unsigned-only generation and sets
+`CONFIG_MCUBOOT_SIGNATURE_KEY_FILE`, so `west build` automatically creates:
 
 ```text
 build_app_u5/zephyr/zephyr.signed.bin
@@ -327,28 +321,24 @@ The slot0 start address is still `0x08010000`.
 
 ### SD-Card DFU Update
 
-Later updates do not require reflashing MCUboot. Build, sign, and verify the
-application, then place the signed `.bin` in the SD-card root as `update.bin`.
+Later updates do not require reflashing MCUboot. Build and verify the
+application, then place the auto-signed `.bin` in the SD-card root as
+`update.bin`.
 
 #### 1. Generate the DFU file
 
 ```bash
-cd /home/jzhang/zephyrproject
+cd /home/usr_name/zephyrproject
 source .venv/bin/activate
 
-REPO=/home/jzhang/zephyrproject/git/ambient-firmware-zephyr
-KEY=/home/jzhang/zephyrproject/keys/bird-mcuboot-ec256.pem
+REPO=/home/usr_name/zephyrproject/git/ambient-firmware-zephyr
+KEY=/home/usr_name/zephyrproject/keys/bird-mcuboot-ec256.pem
 
 west build -p always \
   -b stm32u5_bird \
   $REPO/app_all_task \
   -d build_app_u5 \
   -- -DBOARD_ROOT=$REPO -DDTS_ROOT=$REPO/app_all_task
-
-west sign -d build_app_u5 -t imgtool -- \
-  --key $KEY \
-  --overwrite-only \
-  --align 1
 
 imgtool verify -k $KEY build_app_u5/zephyr/zephyr.signed.bin
 ```
