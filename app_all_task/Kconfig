@@ -68,6 +68,15 @@ config APP_INFERENCE_USE_INT16_QUANT_MODEL
 	  The application still computes MFCC features in float, then quantizes
 	  them before model execution and dequantizes output logits for scoring.
 
+config APP_MIC_MICPGA_GAIN_DB
+	int "ADC3101 microphone PGA gain in dB"
+	default 12
+	range 0 40
+	help
+	  Analog microphone PGA gain applied to both ADC3101 channels. The codec
+	  register uses 0.5 dB steps, so the integer dB value is written as
+	  gain_db * 2.
+
 config APP_LORAWAN_UPLINK_INTERVAL_MS
 	int "LoRaWAN uplink interval"
 	default 1800000

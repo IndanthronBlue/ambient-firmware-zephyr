@@ -106,6 +106,7 @@ application Kconfig definitions are in [app_all_task/Kconfig](app_all_task/Kconf
 | `CONFIG_APP_INFERENCE_LABEL_CNT` | Number of classifier labels. | `11` | Must match the number of non-empty lines in the label file. | `prj.conf`, `Kconfig` |
 | `CONFIG_APP_INFERENCE_LABELS_FILE` | Classifier label file. | `config/inference_labels.txt` | Update together with model labels. | `prj.conf`, `app_all_task/config` |
 | `CONFIG_APP_INFERENCE_USE_INT16_QUANT_MODEL` | Use the int16 quantized model interface. | `y` | Keep `y` for the current model. | `prj.conf` |
+| `CONFIG_APP_MIC_MICPGA_GAIN_DB` | ADC3101 analog microphone PGA gain applied to both channels. | `12` dB | Tune by recorded peak level; lower it if clipping appears. | `prj.conf`, `Kconfig` |
 | `CONFIG_APP_INFERENCE_DETECT_CONF_THRESH_PERCENT` | Detector confidence threshold. | Kconfig default `50` | Tune based on false positives / false negatives. | `Kconfig` |
 | `CONFIG_APP_LORAWAN_UPLINK_INTERVAL_MS` | LoRaWAN uplink interval. | `1800000` ms | Default is 30 minutes; tune by power budget and network capacity. | `prj.conf` |
 | `CONFIG_APP_GPS_UPLINK_WAIT_TIMEOUT_MS` | Time to wait for GPS before uplink. | `60000` ms | `30000~60000` ms is typical. | `prj.conf` |
