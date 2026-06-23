@@ -11,23 +11,34 @@
 
 LOG_MODULE_REGISTER(power_fsm, LOG_LEVEL_INF);
 
-#define ACTIVE_BURST_MS                  (30U * 1000U)
+#define ACTIVE_BURST_MS                  (10U * 1000U)
 #define ACTIVE_CAPTURE_GAP_MS            100U
-#define GPS_UPLINK_WAIT_TIMEOUT_MS       20000U
+#define ACTIVE_UPLINK_WAIT_MS            (10U * 1000U)
+#define ACTIVE_UPLINK_POLL_MS            500U
 #define GPS_RESYNC_PERIOD_SEC            (3U * 60U * 60U)
-#define SUSPEND_TO_ACTIVE_PERIOD_MS      (1U * 60U * 1000U)
-/* #define DEEP_SLEEP_WAKE_PERIOD_MS   (30U * 60U * 1000U) */
-#define DEEP_SLEEP_WAKE_PERIOD_MS        (30U * 1000U)
-#define WDT_SAFE_FEED_SLICE_MS           8000U
+// #define SUSPEND_TO_ACTIVE_PERIOD_MS      (1U * 60U * 1000U)
+#define SUSPEND_TO_ACTIVE_PERIOD_MS      (60U * 1000U)
+#define DEEP_SLEEP_WAKE_PERIOD_MS   (30U * 60U * 1000U) 
+// #define DEEP_SLEEP_WAKE_PERIOD_MS        (30U * 1000U)
+#define CODEC_ZERO_FAULT_SHUTDOWN_STREAK 5U
+#define CODEC_ZERO_FAULT_SHUTDOWN_WAKE_MS (20U * 1000U)
+#define WDT_SAFE_FEED_SLICE_MS           15000U
 
 struct power_fsm_ctx {
 	power_state_t state;
 	uint32_t entered_at_ms;
 	uint32_t suspend_to_active_deadline_ms;
+	uint32_t lorawan_uplink_deadline_ms;
+	uint32_t deep_sleep_wakeup_period_ms;
 	uint32_t deep_sleep_wakeup_deadline_ms;
 	uint32_t active_next_period_deadline_ms;
 	uint32_t active_exit_deadline_ms;
+	bool active_uplink_pending;
+	bool active_uplink_in_progress;
+	task_comm_uplink_type_t active_uplink_type;
+	const char *active_uplink_reason;
 	bool deep_sleep_prepared;
+	uint8_t codec_zero_fault_streak;
 };
 
 static struct power_fsm_ctx fsm;
@@ -164,17 +175,28 @@ static void power_fsm_enter(power_state_t next, const char *reason)
 {
 	uint32_t now = k_uptime_get_32();
 	power_state_t prev = fsm.state;
+	bool release_ina_after_suspend_prepare = false;
 
 	fsm.state = next;
 	fsm.entered_at_ms = now;
 
 	switch (next) {
 	case POWER_STATE_ACTIVE:
-		task_ina3221_block_active(true);
 		fsm.active_next_period_deadline_ms = now;
 		fsm.active_exit_deadline_ms = now + ACTIVE_BURST_MS;
+		fsm.active_uplink_pending = false;
+		fsm.active_uplink_in_progress = false;
+		fsm.active_uplink_type = TASK_COMM_UPLINK_NO_GPS;
+		fsm.active_uplink_reason = "active_entry";
 		/* 恢复电源 */
-		(void)power_ctrl_vperiph_on();
+		int pwr_ret = power_ctrl_vperiph_on();
+		if (pwr_ret < 0) {
+			LOG_WRN("[PWR] v_periph enable failed on ACTIVE entry: %d", pwr_ret);
+			task_sd_mount_async_cancel();
+			power_fsm_enter(POWER_STATE_SUSPEND, "active_entry_vperiph_failed");
+			return;
+		}
+		task_status_led_event(STATUS_LED_ACTIVE_ENTER);
 		/* 配置Codec并开启录音流水线 */
 		if (!task_microphone_is_initialized()) {
 			int mic_ret = task_microphone_init();
@@ -189,14 +211,22 @@ static void power_fsm_enter(power_state_t next, const char *reason)
 		task_sd_mount_async();
 		break;
 	case POWER_STATE_SUSPEND:
-		task_ina3221_block_active(false);
-		fsm.suspend_to_active_deadline_ms = now + SUSPEND_TO_ACTIVE_PERIOD_MS;
+		task_ina3221_block_active(true);
+		if (!task_ina3221_wait_idle(1000U)) {
+			LOG_WRN("[PWR] INA read still busy while entering SUSPEND; continue suspend prep");
+		}
 		/* 卸载SD卡、关闭高耗电外设、进入常规低功耗准备（保留sound wakeup） */
 		(void)power_ctrl_prepare_suspend();
+		fsm.suspend_to_active_deadline_ms =
+			k_uptime_get_32() + SUSPEND_TO_ACTIVE_PERIOD_MS;
+		release_ina_after_suspend_prepare = true;
 		break;
 	case POWER_STATE_DEEP_SLEEP:
 		task_ina3221_block_active(false);
-		fsm.deep_sleep_wakeup_deadline_ms = now + DEEP_SLEEP_WAKE_PERIOD_MS;
+		if (fsm.deep_sleep_wakeup_period_ms == 0U) {
+			fsm.deep_sleep_wakeup_period_ms = DEEP_SLEEP_WAKE_PERIOD_MS;
+		}
+		fsm.deep_sleep_wakeup_deadline_ms = now + fsm.deep_sleep_wakeup_period_ms;
 		fsm.deep_sleep_prepared = false;
 		break;
 	case POWER_STATE_INITIAL:
@@ -205,55 +235,100 @@ static void power_fsm_enter(power_state_t next, const char *reason)
 	}
 
 	LOG_INF("[PWR] %s->%s reason=%s", state_to_str(prev), state_to_str(next), reason);
+
+	if (release_ina_after_suspend_prepare) {
+		task_ina3221_block_active(false);
+	}
+}
+
+static void power_fsm_enter_deep_sleep_with_period(const char *reason, uint32_t wake_period_ms)
+{
+	fsm.deep_sleep_wakeup_period_ms = wake_period_ms;
+	power_fsm_enter(POWER_STATE_DEEP_SLEEP, reason);
+}
+
+static void power_fsm_enter_deep_sleep_default(const char *reason)
+{
+	power_fsm_enter_deep_sleep_with_period(reason, DEEP_SLEEP_WAKE_PERIOD_MS);
+}
+
+static void power_fsm_reset_codec_zero_fault_streak(const char *reason)
+{
+	if (fsm.codec_zero_fault_streak == 0U) {
+		return;
+	}
+
+	LOG_INF("[PWR] codec zero fault streak reset from %u reason=%s",
+		(unsigned int)fsm.codec_zero_fault_streak,
+		reason != NULL ? reason : "unknown");
+	fsm.codec_zero_fault_streak = 0U;
 }
 
 
-static bool power_fsm_should_resync_gps_time(void)
+static bool power_fsm_should_resync_gps_time(const char **reason)
 {
+	if (reason != NULL) {
+		*reason = "not_checked";
+	}
+
+	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED) {
+		if (reason != NULL) {
+			*reason = "mic_debug_skip_gps_lora";
+		}
+		return false;
+	}
+
 	uint32_t now_epoch = 0U;
 	struct retained_state_v1 retained;
 	uint32_t delta = 0U;
 
-	if (task_rtc_get_epoch_utc(&now_epoch) < 0) {
+	if (task_rtc_get_epoch_local(&now_epoch) < 0) {
+		LOG_WRN("[PWR] GPS resync check failed to get RTC local epoch");
+		if (reason != NULL) {
+			*reason = "rtc_epoch_invalid";
+		}
 		return true;
 	}
 
 	if (retained_state_load(&retained) < 0) {
+		LOG_WRN("[PWR] GPS resync check failed to load retained state");
+		if (reason != NULL) {
+			*reason = "retained_load_failed";
+		}
 		return true;
 	}
 
 	if (retained.last_gps_sync_epoch == 0U) {
+		LOG_INF("[PWR] GPS resync needed: no retained GPS sync epoch");
+		if (reason != NULL) {
+			*reason = "no_retained_gps_sync_epoch";
+		}
 		return true;
 	}
 
 	if (!safe_elapsed(now_epoch, retained.last_gps_sync_epoch, &delta)) {
+		LOG_WRN("[PWR] GPS resync check failed to compute elapsed time");
+		if (reason != NULL) {
+			*reason = "rtc_before_last_gps_sync";
+		}
 		return true;
 	}
 
-	return delta >= GPS_RESYNC_PERIOD_SEC;
-}
-
-static void power_fsm_run_periodic_gps_resync_if_needed(void)
-{
-	bool rtc_synced = false;
-
-	if (!power_fsm_should_resync_gps_time()) {
-		return;
+	if (delta < GPS_RESYNC_PERIOD_SEC) {
+		LOG_INF("[PWR] GPS resync not needed, elapsed since last sync=%u sec",
+			(unsigned int)delta);
+		if (reason != NULL) {
+			*reason = "last_gps_sync_fresh";
+		}
+		return false;
 	}
 
-	LOG_INF("[PWR] GPS resync due, start timed sync (%u ms)",
-		(unsigned int)GPS_UPLINK_WAIT_TIMEOUT_MS);
-	if (!task_gps_acquire_with_timeout(GPS_UPLINK_WAIT_TIMEOUT_MS, &rtc_synced)) {
-		LOG_WRN("[PWR] GPS resync timed out, keep current RTC/uplink flow");
-		return;
+	LOG_INF("[PWR] GPS resync needed, elapsed since last sync=%u sec",
+		(unsigned int)delta);
+	if (reason != NULL) {
+		*reason = "last_gps_sync_expired";
 	}
-
-	if (!rtc_synced) {
-		LOG_WRN("[PWR] GPS fix acquired but RTC sync not confirmed during resync");
-		return;
-	}
-
-	LOG_INF("[PWR] GPS periodic resync complete");
+	return true;
 }
 
 int power_fsm_init(void)
@@ -264,10 +339,17 @@ int power_fsm_init(void)
 	fsm.state = POWER_STATE_INITIAL;
 	fsm.entered_at_ms = now;
 	fsm.suspend_to_active_deadline_ms = now + SUSPEND_TO_ACTIVE_PERIOD_MS;
+	fsm.lorawan_uplink_deadline_ms = now + APP_LORAWAN_UPLINK_INTERVAL_MS;
+	fsm.deep_sleep_wakeup_period_ms = DEEP_SLEEP_WAKE_PERIOD_MS;
 	fsm.deep_sleep_wakeup_deadline_ms = now + DEEP_SLEEP_WAKE_PERIOD_MS;
 	fsm.active_next_period_deadline_ms = now;
 	fsm.active_exit_deadline_ms = now + ACTIVE_BURST_MS;
+	fsm.active_uplink_pending = false;
+	fsm.active_uplink_in_progress = false;
+	fsm.active_uplink_type = TASK_COMM_UPLINK_NO_GPS;
+	fsm.active_uplink_reason = "init";
 	fsm.deep_sleep_prepared = false;
+	fsm.codec_zero_fault_streak = 0U;
 	atomic_set(&wake_flags, 0);
 	atomic_set(&pm_enter_count, 0);
 	atomic_set(&pm_exit_count, 0);
@@ -295,6 +377,11 @@ void power_fsm_request_wakeup(uint32_t flags)
 	uint32_t enabled_mask = power_fsm_enabled_wakeup_mask();
 	uint32_t effective_flags = flags & enabled_mask;
 
+	/* Low-battery shutdown is a protection path, not an optional wake source. */
+	if ((flags & POWER_WAKE_SRC_LOW_BAT) != 0U) {
+		effective_flags |= POWER_WAKE_SRC_LOW_BAT;
+	}
+
 	if (effective_flags == 0U) {
 		return;
 	}
@@ -315,6 +402,11 @@ void power_fsm_request_wakeup(uint32_t flags)
 	k_sem_give(&power_fsm_wake_sem);
 }
 
+power_state_t power_fsm_get_state(void)
+{
+	return fsm.state;
+}
+
 k_timeout_t power_fsm_next_wait_timeout(void)
 {
 	if (!APP_LOW_POWER_FSM_ENABLED) {
@@ -330,16 +422,36 @@ k_timeout_t power_fsm_next_wait_timeout(void)
 
 	switch (fsm.state) {
 	case POWER_STATE_ACTIVE:
-		wait_ms = ms_until(now, fsm.active_next_period_deadline_ms);
-		{
-			uint32_t exit_wait_ms = ms_until(now, fsm.active_exit_deadline_ms);
-			if (exit_wait_ms < wait_ms) {
-				wait_ms = exit_wait_ms;
+		if (fsm.active_uplink_in_progress) {
+			wait_ms = ms_until(now, fsm.active_exit_deadline_ms);
+			if (wait_ms > ACTIVE_UPLINK_POLL_MS) {
+				wait_ms = ACTIVE_UPLINK_POLL_MS;
+			}
+		} else {
+			wait_ms = ms_until(now, fsm.active_next_period_deadline_ms);
+			{
+				uint32_t exit_wait_ms = ms_until(now, fsm.active_exit_deadline_ms);
+				if (exit_wait_ms < wait_ms) {
+					wait_ms = exit_wait_ms;
+				}
+			}
+			{
+				uint32_t uplink_wait_ms =
+					ms_until(now, fsm.lorawan_uplink_deadline_ms);
+				if (uplink_wait_ms < wait_ms) {
+					wait_ms = uplink_wait_ms;
+				}
 			}
 		}
 		break;
 	case POWER_STATE_SUSPEND:
 		wait_ms = ms_until(now, fsm.suspend_to_active_deadline_ms);
+		{
+			uint32_t uplink_wait_ms = ms_until(now, fsm.lorawan_uplink_deadline_ms);
+			if (uplink_wait_ms < wait_ms) {
+				wait_ms = uplink_wait_ms;
+			}
+		}
 		break;
 	case POWER_STATE_DEEP_SLEEP:
 		wait_ms = fsm.deep_sleep_prepared ?
@@ -365,6 +477,7 @@ void power_fsm_wait_for_event(k_timeout_t timeout)
 			if (k_sem_take(&power_fsm_wake_sem, K_MSEC(WDT_SAFE_FEED_SLICE_MS)) == 0) {
 				return;
 			}
+			task_watchdog_mark_main_alive();
 			task_watchdog_feed();
 		}
 	}
@@ -384,6 +497,7 @@ void power_fsm_wait_for_event(k_timeout_t timeout)
 			return;
 		}
 
+		task_watchdog_mark_main_alive();
 		task_watchdog_feed();
 	}
 }
@@ -407,61 +521,169 @@ static void power_fsm_wake_suspend_to_active(const char *reason)
 	power_fsm_enter(POWER_STATE_ACTIVE, reason);
 }
 
+static bool power_fsm_prepare_timed_uplink(uint32_t now)
+{
+	if (!time_reached(now, fsm.lorawan_uplink_deadline_ms)) {
+		return false;
+	}
+
+	if (fsm.active_uplink_pending || fsm.active_uplink_in_progress ||
+	    task_comm_is_pending_or_busy()) {
+		return false;
+	}
+
+	task_comm_uplink_type_t uplink_type =
+		APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED ?
+		TASK_COMM_UPLINK_NO_GPS : TASK_COMM_UPLINK_WAIT_GPS;
+	const char *uplink_reason = APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED ?
+		"mic_debug_skip_gps_lora" : "gps_resync_default";
+	uint32_t epoch = 0U;
+
+	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED) {
+		LOG_INF("[PWR] microphone debug mode: timed uplink prepared without GPS");
+	} else if (task_rtc_get_epoch_local(&epoch) == 0) {
+		LOG_INF("[PWR] timed uplink timestamp(local_epoch)=%u", (unsigned int)epoch);
+		if (!power_fsm_should_resync_gps_time(&uplink_reason)) {
+			uplink_type = TASK_COMM_UPLINK_NO_GPS;
+		}
+	} else {
+		LOG_WRN("[PWR] RTC invalid, timed uplink type fallback to WAIT_GPS");
+		uplink_reason = "rtc_epoch_invalid";
+	}
+
+	task_sensor_sample();
+	task_inference_snapshot_uplink_window();
+	advance_deadline(&fsm.lorawan_uplink_deadline_ms,
+			 APP_LORAWAN_UPLINK_INTERVAL_MS, now);
+
+	fsm.active_uplink_type = uplink_type;
+	fsm.active_uplink_reason = uplink_reason;
+	fsm.active_uplink_pending = true;
+	fsm.active_exit_deadline_ms = now;
+	task_status_led_event(STATUS_LED_UPLINK_READY);
+	task_watchdog_feed();
+	LOG_INF("[PWR] timed infer window ready: deferred comm uplink prepared (type=%d reason=%s next_in=%u ms)",
+		(int)uplink_type,
+		uplink_reason,
+		(unsigned int)ms_until(k_uptime_get_32(), fsm.lorawan_uplink_deadline_ms));
+	if (uplink_type == TASK_COMM_UPLINK_WAIT_GPS) {
+		LOG_INF("[PWR] WAIT_GPS required: reason=%s timeout=%u ms",
+			uplink_reason,
+			(unsigned int)APP_GPS_UPLINK_WAIT_TIMEOUT_MS);
+	}
+
+	return true;
+}
+
 static void power_fsm_tick_active(uint32_t now)
 {
-	if (task_comm_is_pending_or_busy()) {
-		LOG_WRN("[PWR] comm is pending or busy, extend active burst deadline");
-		fsm.active_exit_deadline_ms = now + 20000U;
-		if (time_reached(now, fsm.active_next_period_deadline_ms)) {
-			fsm.active_next_period_deadline_ms = now + 20000U;
+	if (fsm.active_uplink_in_progress) {
+		if (!task_comm_is_pending_or_busy()) {
+			LOG_INF("[PWR] deferred comm uplink complete, entering suspend");
+			fsm.active_uplink_in_progress = false;
+			power_fsm_enter(POWER_STATE_SUSPEND, "uplink_complete");
+			return;
 		}
+
+		if (time_reached(now, fsm.active_exit_deadline_ms)) {
+			LOG_INF("[PWR] comm uplink still busy, keep ACTIVE without capture");
+			fsm.active_exit_deadline_ms = now + ACTIVE_UPLINK_WAIT_MS;
+		}
+
+		return;
+	}
+
+	if (task_comm_is_pending_or_busy()) {
+		LOG_INF("[PWR] comm is pending or busy, pause capture until uplink completes");
+		fsm.active_uplink_in_progress = true;
+		fsm.active_exit_deadline_ms = now + ACTIVE_UPLINK_WAIT_MS;
+		return;
+	}
+
+	if (power_fsm_prepare_timed_uplink(now)) {
 		return;
 	}
 
 	if (time_reached(now, fsm.active_exit_deadline_ms)) {
-		/* 准备退出 ACTIVE，检查是否需要同步 GPS */
-		task_watchdog_feed();
-		power_fsm_run_periodic_gps_resync_if_needed();
-		task_watchdog_feed();
+		if (fsm.active_uplink_pending) {
+			LOG_INF("[PWR] active end: trigger deferred comm uplink (type=%d reason=%s)",
+				(int)fsm.active_uplink_type,
+				fsm.active_uplink_reason != NULL ? fsm.active_uplink_reason : "unknown");
+			task_watchdog_feed();
+			task_comm_request_uplink_typed(fsm.active_uplink_type);
+			task_watchdog_feed();
+			fsm.active_uplink_pending = false;
+			fsm.active_uplink_in_progress = true;
+			fsm.active_exit_deadline_ms = k_uptime_get_32() + ACTIVE_UPLINK_WAIT_MS;
+			return;
+		}
+
+		if (task_comm_is_pending_or_busy()) {
+			LOG_INF("[PWR] active end: comm still pending/busy, pause capture");
+			fsm.active_uplink_in_progress = true;
+			fsm.active_exit_deadline_ms = k_uptime_get_32() + ACTIVE_UPLINK_WAIT_MS;
+			return;
+		}
+
 		power_fsm_enter(POWER_STATE_SUSPEND, "active_burst_complete");
 		return;
 	}
 
 	if (time_reached(now, fsm.active_next_period_deadline_ms)) {
 		task_watchdog_feed();
-		task_microphone_capture_once();
+		bool capture_ok = task_microphone_capture_once();
 		task_watchdog_feed();
-		// task_imu_sample();
-
-		if (app_state.infer_window_ready) {
-			/* 推理十次（即 infer_window_ready 为 true）时触发 LoRa 发送 */
-			task_comm_uplink_type_t uplink_type = TASK_COMM_UPLINK_WAIT_GPS;
-			uint32_t epoch = 0U;
-			if (task_rtc_get_epoch_utc(&epoch) == 0) {
-				LOG_INF("[PWR] uplink timestamp(epoch)=%u", (unsigned int)epoch);
-				if (!power_fsm_should_resync_gps_time()) {
-					uplink_type = TASK_COMM_UPLINK_NO_GPS;
+		if (!capture_ok) {
+			if (app_state.mic_codec_zero_fault) {
+				if (fsm.codec_zero_fault_streak < UINT8_MAX) {
+					fsm.codec_zero_fault_streak++;
 				}
-			} else {
-				LOG_WRN("[PWR] RTC invalid, uplink type fallback to WAIT_GPS");
+				LOG_WRN("[PWR] codec zero fault streak=%u/%u",
+					(unsigned int)fsm.codec_zero_fault_streak,
+					(unsigned int)CODEC_ZERO_FAULT_SHUTDOWN_STREAK);
+				app_state.mic_codec_zero_fault = false;
+
+				if (fsm.codec_zero_fault_streak >= CODEC_ZERO_FAULT_SHUTDOWN_STREAK) {
+					LOG_ERR("[PWR] codec zero fault threshold reached; arm RTC wake in %u sec and shutdown",
+						(unsigned int)(CODEC_ZERO_FAULT_SHUTDOWN_WAKE_MS / 1000U));
+					fsm.codec_zero_fault_streak = 0U;
+					power_fsm_enter_deep_sleep_with_period("codec_zero_fault_threshold",
+						CODEC_ZERO_FAULT_SHUTDOWN_WAKE_MS);
+					return;
+				}
+
+				LOG_WRN("[PWR] codec zero fault detected; send one RMS=0 LoRa fault uplink then suspend");
+				task_inference_prepare_codec_zero_fault_uplink();
+				fsm.active_uplink_pending = false;
+				fsm.active_uplink_type = TASK_COMM_UPLINK_NO_GPS;
+				fsm.active_uplink_reason = "codec_zero_fault";
+				task_status_led_event(STATUS_LED_UPLINK_READY);
+				task_comm_request_uplink_typed(TASK_COMM_UPLINK_NO_GPS);
+				fsm.active_uplink_in_progress = true;
+				fsm.active_exit_deadline_ms = k_uptime_get_32() + ACTIVE_UPLINK_WAIT_MS;
+				return;
 			}
 
-			task_sensor_sample();
-			task_inference_snapshot_uplink_window();
-			task_watchdog_feed();
-			task_comm_request_uplink_typed(uplink_type);
-			task_watchdog_feed();
-		}
-		// power_fsm_run_gps_drift_sync_if_needed();
+			if (fsm.active_uplink_pending) {
+				power_fsm_reset_codec_zero_fault_streak("capture_failed_pending_uplink");
+				LOG_WRN("[PWR] capture failed/incomplete while uplink pending; send pending uplink first");
+				task_comm_request_uplink_typed(fsm.active_uplink_type);
+				fsm.active_uplink_pending = false;
+				fsm.active_uplink_in_progress = true;
+				fsm.active_exit_deadline_ms = k_uptime_get_32() + ACTIVE_UPLINK_WAIT_MS;
+				return;
+			}
 
-		fsm.active_next_period_deadline_ms = k_uptime_get_32() + ACTIVE_CAPTURE_GAP_MS;
-
-		if (task_comm_is_pending_or_busy()) {
-			LOG_WRN("[PWR] comm is pending or busy, extend active burst deadline");
-			fsm.active_exit_deadline_ms = k_uptime_get_32() + 20000U;
-			fsm.active_next_period_deadline_ms = k_uptime_get_32() + 20000U;
+			power_fsm_reset_codec_zero_fault_streak("capture_failed_non_zero_fault");
+			LOG_WRN("[PWR] capture failed/incomplete; end ACTIVE cycle to reset codec next wake");
+			power_fsm_enter(POWER_STATE_SUSPEND, "active_capture_failed");
 			return;
 		}
+		power_fsm_reset_codec_zero_fault_streak("capture_ok");
+		// task_imu_sample();
+		(void)power_fsm_prepare_timed_uplink(k_uptime_get_32());
+
+		fsm.active_next_period_deadline_ms = k_uptime_get_32() + ACTIVE_CAPTURE_GAP_MS;
 	}
 }
 
@@ -471,7 +693,7 @@ static void power_fsm_tick_suspend(uint32_t now)
 
 	if ((wake & POWER_WAKE_SRC_LOW_BAT) != 0U) {
 		LOG_WRN("[PWR] SUSPEND->DEEP_SLEEP reason=low_battery_event");
-		power_fsm_enter(POWER_STATE_DEEP_SLEEP, "low_battery_event");
+		power_fsm_enter_deep_sleep_default("low_battery_event");
 		return;
 	}
 
@@ -501,6 +723,11 @@ static void power_fsm_tick_suspend(uint32_t now)
 				SUSPEND_TO_ACTIVE_PERIOD_MS, now);
 	}
 
+	if (time_reached(now, fsm.lorawan_uplink_deadline_ms)) {
+		power_fsm_wake_suspend_to_active("lorawan_uplink_interval");
+		return;
+	}
+
 	if ((wake & POWER_WAKE_SRC_PERIODIC) != 0U) {
 		power_fsm_wake_suspend_to_active("periodic_window");
 	}
@@ -516,7 +743,9 @@ static void power_fsm_tick_deep_sleep(uint32_t now)
 
 		fsm.deep_sleep_prepared = true;
 
-		alarm_ret = task_rtc_set_alarm_in_seconds(DEEP_SLEEP_WAKE_PERIOD_MS / 1000U);
+		uint32_t wake_period_ms = (fsm.deep_sleep_wakeup_period_ms != 0U) ?
+			fsm.deep_sleep_wakeup_period_ms : DEEP_SLEEP_WAKE_PERIOD_MS;
+		alarm_ret = task_rtc_set_alarm_in_seconds(wake_period_ms / 1000U);
 		if (alarm_ret < 0) {
 			LOG_ERR("[PWR] deep_sleep abort: rtc alarm setup failed: %d", alarm_ret);
 			LOG_ERR("[PWR] deep_sleep abort: keep system running, skip sys_poweroff");
@@ -537,9 +766,9 @@ static void power_fsm_tick_deep_sleep(uint32_t now)
 		}
 
 		LOG_WRN("[PWR] deep sleep path entering sys_poweroff in %u ms wake window",
-			(unsigned int)DEEP_SLEEP_WAKE_PERIOD_MS);
+			(unsigned int)wake_period_ms);
 		LOG_WRN("[PWR] deep sleep final state: alarm armed, rails prepared");
-		k_msleep(5000);
+		k_msleep((wake_period_ms <= 60000U) ? 200U : 5000U);
 
 		if (APP_DEEP_SLEEP_ENABLED && !APP_DEEP_SLEEP_SIMULATE_ENABLED) {
 			task_rtc_prepare_shutdown_wakeup_route();
@@ -565,7 +794,7 @@ void power_fsm_tick(void)
 		(void)atomic_and(&wake_flags, (atomic_val_t)(~POWER_WAKE_SRC_LOW_BAT));
 		LOG_WRN("[PWR] %s->DEEP_SLEEP reason=low_battery_event",
 			state_to_str(fsm.state));
-		power_fsm_enter(POWER_STATE_DEEP_SLEEP, "low_battery_event");
+		power_fsm_enter_deep_sleep_default("low_battery_event");
 		return;
 	}
 

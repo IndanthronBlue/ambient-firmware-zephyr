@@ -36,6 +36,68 @@
 				pinmux = <STM32_PINMUX('C', 11, AF6)>;
 				bias-pull-up;
 			};
+			i2c1_scl_pb8_sleep: i2c1_scl_pb8_sleep {
+				pinmux = <STM32_PINMUX('B', 8, ANALOG)>;
+			};
+			i2c1_sda_pb9_sleep: i2c1_sda_pb9_sleep {
+				pinmux = <STM32_PINMUX('B', 9, ANALOG)>;
+			};
+			i2c2_scl_pb13_sleep: i2c2_scl_pb13_sleep {
+				pinmux = <STM32_PINMUX('B', 13, ANALOG)>;
+			};
+			i2c2_sda_pb14_sleep: i2c2_sda_pb14_sleep {
+				pinmux = <STM32_PINMUX('B', 14, ANALOG)>;
+			};
+			//<&sai1_mclk_b_pb4 &sai1_sd_b_pb5 &sai1_fs_b_pb6 &sai1_sck_b_pb3>;
+			sai1_mclk_b_pb4_sleep: sai1_mclk_b_pb4_sleep {
+				pinmux = <STM32_PINMUX('B', 4, ANALOG)>;
+			};
+			sai1_sd_b_pb5_sleep: sai1_sd_b_pb5_sleep {
+				pinmux = <STM32_PINMUX('B', 5, ANALOG)>;
+			};
+			sai1_fs_b_pb6_sleep: sai1_fs_b_pb6_sleep {
+				pinmux = <STM32_PINMUX('B', 6, ANALOG)>;
+			};
+			sai1_sck_b_pb3_sleep: sai1_sck_b_pb3_sleep {
+				pinmux = <STM32_PINMUX('B', 3, ANALOG)>;
+			};
+		};
+	};
+	
+	cpus {
+		cpu0: cpu@0 {
+			cpu-power-states = <&stop0 &stop1 &stop2>;
+		};
+
+		power-states {
+			stop0: state0 {
+				compatible = "zephyr,power-state";
+				power-state-name = "suspend-to-idle";
+				substate-id = <1>; /* 对应 STM32U5 power.c 中的 STOP0 */
+				min-residency-us = <100>;
+				exit-latency-us = <10>;
+			};
+			stop1: state1 {
+				compatible = "zephyr,power-state";
+				power-state-name = "suspend-to-idle";
+				substate-id = <2>; /* 对应 STM32U5 power.c 中的 STOP1 */
+				min-residency-us = <500>;
+				exit-latency-us = <20>;
+			};
+			stop2: state2 {
+				compatible = "zephyr,power-state";
+				power-state-name = "suspend-to-idle";
+				substate-id = <3>;
+				min-residency-us = <2000>;
+				exit-latency-us = <50>;
+			};
+			standby: state3 {
+				compatible = "zephyr,power-state";
+				power-state-name = "standby";
+				substate-id = <0>;
+				min-residency-us = <50000>;
+				exit-latency-us = <1000>;
+			};
 		};
 	};
 	
@@ -90,7 +152,7 @@
 	v_periph: v-periph-ctrl {
 		compatible = "regulator-fixed";
 		regulator-name = "v-periph";
-		enable-gpios = <&gpioc 13 GPIO_ACTIVE_HIGH>;
+		enable-gpios = <&gpiob 7 GPIO_ACTIVE_HIGH>;
 		startup-delay-us = <2500>;
 		regulator-boot-on;
 	};
@@ -103,6 +165,12 @@
 		mcuboot-button0 = &user_button;
 		gps-init = &gps_init;
 		gps-vbckp = &gps_vbckp;
+	};
+
+	power_ctrl_pins: power-ctrl-pins {
+		sd-on-gpios = <&gpioc 13 GPIO_ACTIVE_HIGH>;
+		spi3-sck-gpios = <&gpioc 10 GPIO_ACTIVE_HIGH>;
+		spi3-mosi-gpios = <&gpioc 12 GPIO_ACTIVE_HIGH>;
 	};
 };
 
@@ -165,6 +233,12 @@
 	apb3-prescaler = <1>;
 };
 
+stm32_lp_tick_source: &lptim1 {
+	clocks = <&rcc STM32_CLOCK(APB3, 11)>,
+		 <&rcc STM32_SRC_LSE LPTIM1_SEL(3)>;
+	status = "okay";
+};
+
 &usart1 {
 	pinctrl-0 = <&usart1_tx_pb6 &usart1_rx_pa10>;
 	pinctrl-names = "default";
@@ -193,7 +267,8 @@
 
 &i2c1 {
 	pinctrl-0 = <&i2c1_scl_pb8 &i2c1_sda_pb9>;
-	pinctrl-names = "default";
+	pinctrl-1 = <&i2c1_scl_pb8_sleep &i2c1_sda_pb9_sleep>;
+	pinctrl-names = "default", "sleep";
 	scl-gpios = <&gpiob 8 (GPIO_OPEN_DRAIN | GPIO_ACTIVE_HIGH)>;
     sda-gpios = <&gpiob 9 (GPIO_OPEN_DRAIN | GPIO_ACTIVE_HIGH)>;
 	status = "okay";
@@ -204,6 +279,10 @@
 		status = "okay";
 		reg = <0x76>;
 		vin-supply = <&v_periph>;
+		/* Defer initialization until runtime when I2C is stable and less contended.
+		 * This prevents PM device suspend issues during early boot when multiple
+		 * I2C devices are competing for bus access (ADC3101, GPS, INA3221). */
+		zephyr,deferred-init;
 	};
 
 	cam_m8q: gps@10 {
@@ -250,7 +329,8 @@
 
 &i2c2 {
 	pinctrl-0 = <&i2c2_scl_pb13 &i2c2_sda_pb14>;
-	pinctrl-names = "default";
+	pinctrl-1 = <&i2c2_scl_pb13_sleep &i2c2_sda_pb14_sleep>;
+	pinctrl-names = "default", "sleep";
 	clock-frequency = <I2C_BITRATE_STANDARD>;
 	scl-gpios = <&gpiob 13 (GPIO_OPEN_DRAIN | GPIO_PULL_UP)>;
 	sda-gpios = <&gpiob 14 (GPIO_OPEN_DRAIN | GPIO_PULL_UP)>;
@@ -310,9 +390,15 @@
 
 
 &rtc {
+	compatible = "st,stm32-rtc";
 	clocks = <&rcc STM32_CLOCK(APB3, 21)>,
 		 <&rcc STM32_SRC_LSE RTC_SEL(1)>;
+	wakeup-source;
 	status = "okay";
+};
+
+&gpioc {
+	wakeup-source;
 };
 
 &sdmmc1 {

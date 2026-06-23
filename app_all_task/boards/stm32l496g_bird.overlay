@@ -1,4 +1,5 @@
 #include <zephyr/dt-bindings/gpio/gpio.h>
+#include <zephyr/dt-bindings/pinctrl/stm32-pinctrl.h>
 
 /* Board-specific overlay to enable SAI1 Block B and correct audio PLL setup */
 
@@ -31,6 +32,79 @@
 		zephyr,console = &usart2;
 		zephyr,shell-uart = &usart2;
 		zephyr,code-partition = &slot0_partition;
+		zephyr,retained-ram = &retained_mem;
+		zephyr,retained-mem = &app_retention;
+	};
+
+	power_ctrl_pins: power-ctrl-pins {
+		compatible = "bird,power-ctrl-pins";
+		spi3-sck-gpios = <&gpioc 10 GPIO_ACTIVE_HIGH>;
+		spi3-mosi-gpios = <&gpioc 12 GPIO_ACTIVE_HIGH>;
+		spi3-miso-gpios = <&gpioc 11 GPIO_ACTIVE_HIGH>;
+	};
+
+	retained_mem: retainedmem-bbram {
+		compatible = "bird,retained-bbram";
+		bbram = <&bbram>;
+		offset = <0x8>;
+		size = <0x78>;
+		status = "okay";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		app_retention: retention@0 {
+			compatible = "zephyr,retention";
+			status = "okay";
+			reg = <0x0 0x78>;
+			prefix = [4C 34];
+			checksum = <1>;
+		};
+	};
+};
+
+&{/soc/pin-controller@48000000} {
+	spi3_sck_pc10_sleep: spi3_sck_pc10_sleep {
+		pinmux = <STM32_PINMUX('C', 10, ANALOG)>;
+	};
+
+	spi3_miso_pc11_sleep: spi3_miso_pc11_sleep {
+		pinmux = <STM32_PINMUX('C', 11, ANALOG)>;
+	};
+
+	spi3_mosi_pc12_sleep: spi3_mosi_pc12_sleep {
+		pinmux = <STM32_PINMUX('C', 12, ANALOG)>;
+	};
+
+	sai1_sck_b_pb3_sleep: sai1_sck_b_pb3_sleep {
+		pinmux = <STM32_PINMUX('B', 3, ANALOG)>;
+	};
+
+	sai1_mclk_b_pb4_sleep: sai1_mclk_b_pb4_sleep {
+		pinmux = <STM32_PINMUX('B', 4, ANALOG)>;
+	};
+
+	sai1_sd_b_pb5_sleep: sai1_sd_b_pb5_sleep {
+		pinmux = <STM32_PINMUX('B', 5, ANALOG)>;
+	};
+
+	sai1_fs_b_pb6_sleep: sai1_fs_b_pb6_sleep {
+		pinmux = <STM32_PINMUX('B', 6, ANALOG)>;
+	};
+
+	i2c1_scl_pb8_sleep: i2c1_scl_pb8_sleep {
+		pinmux = <STM32_PINMUX('B', 8, ANALOG)>;
+	};
+
+	i2c1_sda_pb9_sleep: i2c1_sda_pb9_sleep {
+		pinmux = <STM32_PINMUX('B', 9, ANALOG)>;
+	};
+
+	i2c2_scl_pb13_sleep: i2c2_scl_pb13_sleep {
+		pinmux = <STM32_PINMUX('B', 13, ANALOG)>;
+	};
+
+	i2c2_sda_pb14_sleep: i2c2_sda_pb14_sleep {
+		pinmux = <STM32_PINMUX('B', 14, ANALOG)>;
 	};
 };
 
@@ -54,7 +128,9 @@
 
 &sai1_b {
 	pinctrl-0 = <&sai1_mclk_b_pb4 &sai1_sd_b_pb5 &sai1_fs_b_pb6 &sai1_sck_b_pb3>;
-	pinctrl-names = "default";
+	pinctrl-1 = <&sai1_mclk_b_pb4_sleep &sai1_sd_b_pb5_sleep
+		     &sai1_fs_b_pb6_sleep &sai1_sck_b_pb3_sleep>;
+	pinctrl-names = "default", "sleep";
 	mclk-enable;
 	mclk-divider = "div-256";
 	dma-names = "rx";
@@ -83,6 +159,8 @@
 };
 
 &i2c2 {
+	pinctrl-1 = <&i2c2_scl_pb13_sleep &i2c2_sda_pb14_sleep>;
+	pinctrl-names = "default", "sleep";
 	clock-frequency = <100000>;
 };
 
@@ -104,9 +182,27 @@
 	status = "okay";
 };
 
+&clk_lse {
+	status = "okay";
+};
+
+stm32_lp_tick_source: &lptim1 {
+	clocks = <&rcc STM32_CLOCK(APB1, 31)>,
+		 <&rcc STM32_SRC_LSE LPTIM1_SEL(3)>;
+	status = "okay";
+};
+
 &rtc {
+	clocks = <&rcc STM32_CLOCK(APB1, 28)>,
+		 <&rcc STM32_SRC_LSE RTC_SEL(1)>;
 	status = "okay";
 	wakeup-source;
+
+	bbram: backup_regs {
+		compatible = "st,stm32-bbram";
+		st,backup-regs = <32>;
+		status = "okay";
+	};
 };
 
 &gpioa {
@@ -116,6 +212,8 @@
 
 &i2c1 {
 	/* Lower bitrate for more robust GNSS NMEA-over-I2C */
+	pinctrl-1 = <&i2c1_scl_pb8_sleep &i2c1_sda_pb9_sleep>;
+	pinctrl-names = "default", "sleep";
 	clock-frequency = <100000>;
 	kxtj3: kxtj3@f {
 		compatible = "kionix,kxtj3-1057";
@@ -123,4 +221,10 @@
 		status = "okay";
 	};
 	status = "okay";
+};
+
+&spi3 {
+	pinctrl-0 = <&spi3_sck_pc10 &spi3_miso_pc11_pullup &spi3_mosi_pc12>;
+	pinctrl-1 = <&spi3_sck_pc10_sleep &spi3_miso_pc11_sleep &spi3_mosi_pc12_sleep>;
+	pinctrl-names = "default", "sleep";
 };

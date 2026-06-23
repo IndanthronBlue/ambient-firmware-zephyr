@@ -26,6 +26,7 @@ int power_fsm_init(void);
 void power_fsm_tick(void);
 void power_fsm_notify_active_done(void);
 void power_fsm_request_wakeup(uint32_t wake_flags);
+power_state_t power_fsm_get_state(void);
 k_timeout_t power_fsm_next_wait_timeout(void);
 void power_fsm_wait_for_event(k_timeout_t timeout);
 

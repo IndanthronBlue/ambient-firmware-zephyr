@@ -1,0 +1,27 @@
+description: Retained memory window backed by a BBRAM device
+
+compatible: "bird,retained-bbram"
+
+include: base.yaml
+
+properties:
+  bbram:
+    type: phandle
+    required: true
+    description: BBRAM device used as the retained storage backend
+
+  offset:
+    type: int
+    default: 0
+    description: Byte offset into the BBRAM device
+
+  size:
+    type: int
+    required: true
+    description: Size of the retained memory window in bytes
+
+  "#address-cells":
+    const: 1
+
+  "#size-cells":
+    const: 1

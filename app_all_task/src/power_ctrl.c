@@ -13,8 +13,12 @@
 #endif
 
 #include "tasks.h"
+#include "app_feature_flags.h"
 
 LOG_MODULE_REGISTER(power_ctrl, LOG_LEVEL_INF);
+
+#define VPERIPH_MIN_OFF_MS     50U
+#define VPERIPH_RAIL_SETTLE_MS 250U
 
 /*
 #if DT_NODE_HAS_STATUS(DT_NODELABEL(v_periph), okay)
@@ -49,6 +53,13 @@ static const struct gpio_dt_spec led0_gpio = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gp
 static const struct gpio_dt_spec led0_gpio = {0};
 #endif
 
+#if DT_NODE_HAS_PROP(DT_NODELABEL(power_ctrl_pins), sd_on_gpios)
+static const struct gpio_dt_spec sd_on_gpio =
+	GPIO_DT_SPEC_GET(DT_NODELABEL(power_ctrl_pins), sd_on_gpios);
+#else
+static const struct gpio_dt_spec sd_on_gpio = {0};
+#endif
+
 #if DT_NODE_HAS_PROP(DT_NODELABEL(power_ctrl_pins), spi3_sck_gpios)
 static const struct gpio_dt_spec spi3_sck_gpio =
 	GPIO_DT_SPEC_GET(DT_NODELABEL(power_ctrl_pins), spi3_sck_gpios);
@@ -61,6 +72,20 @@ static const struct gpio_dt_spec spi3_mosi_gpio =
 	GPIO_DT_SPEC_GET(DT_NODELABEL(power_ctrl_pins), spi3_mosi_gpios);
 #else
 static const struct gpio_dt_spec spi3_mosi_gpio = {0};
+#endif
+
+#if DT_NODE_HAS_PROP(DT_NODELABEL(power_ctrl_pins), spi3_miso_gpios)
+static const struct gpio_dt_spec spi3_miso_gpio =
+	GPIO_DT_SPEC_GET(DT_NODELABEL(power_ctrl_pins), spi3_miso_gpios);
+#else
+static const struct gpio_dt_spec spi3_miso_gpio = {0};
+#endif
+
+#if DT_NODE_HAS_PROP(DT_NODELABEL(power_ctrl_pins), sd_cd_gpios)
+static const struct gpio_dt_spec sd_cd_gpio =
+	GPIO_DT_SPEC_GET(DT_NODELABEL(power_ctrl_pins), sd_cd_gpios);
+#else
+static const struct gpio_dt_spec sd_cd_gpio = {0};
 #endif
 
 #if DT_NODE_HAS_PROP(DT_NODELABEL(spi3), cs_gpios)
@@ -128,6 +153,8 @@ static const struct device *const spi3_dev;
 #endif
 
 static bool vperiph_io_parked;
+static bool vperiph_powered;
+static uint32_t vperiph_off_at_ms;
 static bool spi3_pm_suspended;
 
 static void power_ctrl_try_apply_sleep_pinctrl(const struct pinctrl_dev_config *pcfg,
@@ -201,6 +228,18 @@ static void power_ctrl_gpio_disconnect(const struct gpio_dt_spec *spec, const ch
 		return;
 	}
 
+#if defined(CONFIG_SOC_SERIES_STM32U5X)
+	const struct gpio_stm32_config *cfg = spec->port->config;
+
+	if (cfg != NULL) {
+		uint32_t pwr_port = ((uint32_t)LL_PWR_GPIO_PORTA) + (cfg->port * 8U);
+		uint32_t pin_mask = BIT(spec->pin);
+
+		LL_PWR_DisableGPIOPullUp(pwr_port, pin_mask);
+		LL_PWR_DisableGPIOPullDown(pwr_port, pin_mask);
+	}
+#endif
+
 	int ret = gpio_pin_configure_dt(spec, GPIO_DISCONNECTED);
 	if (ret < 0) {
 		LOG_DBG("%s disconnect failed: %d", name, ret);
@@ -223,6 +262,28 @@ static void power_ctrl_gpio_force_low(const struct gpio_dt_spec *spec, const cha
 	if (ret < 0) {
 		LOG_DBG("%s force low failed: %d", name, ret);
 	}
+}
+
+static int power_ctrl_gpio_configure_set_high(const struct gpio_dt_spec *spec, const char *name)
+{
+	if ((spec == NULL) || (spec->port == NULL) || !gpio_is_ready_dt(spec)) {
+		LOG_WRN("%s GPIO not ready", name);
+		return -ENODEV;
+	}
+
+	int ret = gpio_pin_configure_dt(spec, GPIO_OUTPUT_ACTIVE);
+	if (ret < 0) {
+		LOG_ERR("%s GPIO configure failed: %d", name, ret);
+		return ret;
+	}
+
+	ret = gpio_pin_set_dt(spec, 1);
+	if (ret < 0) {
+		LOG_ERR("%s GPIO set HIGH failed: %d", name, ret);
+		return ret;
+	}
+
+	return 0;
 }
 
 /**
@@ -260,6 +321,44 @@ static void power_ctrl_gpio_force_low_and_hold_lp(const struct gpio_dt_spec *spe
 #else
 	ARG_UNUSED(spec);
 	ARG_UNUSED(name);
+#endif
+}
+
+/**
+ * @brief Configure a GPIO as pulled-up input and retain pull-up in low power.
+ *
+ * @param spec GPIO specification to update.
+ * @param name Human-readable GPIO name used for logging.
+ */
+static void power_ctrl_gpio_pull_up_and_hold_lp(const struct gpio_dt_spec *spec, const char *name)
+{
+	if ((spec == NULL) || (spec->port == NULL) || !device_is_ready(spec->port)) {
+		return;
+	}
+
+	int ret = gpio_pin_configure(spec->port, spec->pin, GPIO_INPUT | GPIO_PULL_UP);
+	if (ret < 0) {
+		LOG_DBG("%s pull-up failed: %d", name, ret);
+		return;
+	}
+
+#if defined(CONFIG_SOC_SERIES_STM32U5X)
+	const struct gpio_stm32_config *cfg = spec->port->config;
+	if (cfg == NULL) {
+		return;
+	}
+
+	uint32_t pwr_port = ((uint32_t)LL_PWR_GPIO_PORTA) + (cfg->port * 8U);
+	uint32_t pin_mask = BIT(spec->pin);
+
+	LL_PWR_EnablePUPDConfig();
+	LL_PWR_DisableGPIOPullDown(pwr_port, pin_mask);
+	LL_PWR_EnableGPIOPullUp(pwr_port, pin_mask);
+
+	LOG_DBG("%s LP hold configured: port=%u pin=%u pullup=1",
+		name,
+		(unsigned int)cfg->port,
+		(unsigned int)spec->pin);
 #endif
 }
 
@@ -303,30 +402,33 @@ static void power_ctrl_gpio_restore_output_inactive(const struct gpio_dt_spec *s
 /**
  * @brief Park v_periph-related GPIOs into low-leakage states.
  *
- * Applies strong-low parking on selected lines and disconnects selected input
- * lines to reduce leakage during suspend.
+ * Applies strong-low parking on selected lines and disconnects selected lines
+ * where driving an unpowered peripheral could back-feed the rail.
  */
 static void power_ctrl_park_vperiph_gpio(void)
 {
-	/* Arduino-style strong-low parking for known leakage paths.
-	 * Keep the old disconnect strategy below as commented reference.
-	 */
+	/* Strong-low parking for known board leakage paths. */
 	power_ctrl_gpio_force_low_and_hold_lp(&led0_gpio, "led0");
-	power_ctrl_gpio_force_low_and_hold_lp(&spi3_sck_gpio, "spi3_sck");
-	power_ctrl_gpio_force_low_and_hold_lp(&spi3_mosi_gpio, "spi3_mosi");
-	power_ctrl_gpio_force_low_and_hold_lp(&spi3_cs_lora, "spi3_cs_lora");
-	power_ctrl_gpio_force_low_and_hold_lp(&spi3_cs_sd, "spi3_cs_sd");
-	power_ctrl_gpio_force_low_and_hold_lp(&lora_reset, "lora_reset");
-	power_ctrl_gpio_force_low_and_hold_lp(&lora_rxen, "lora_rxen");
-
-	/* Previous high-Z parking kept for comparison/debugging.
-	power_ctrl_gpio_disconnect(&spi3_cs_lora, "spi3_cs_lora");
+	/* Leave every SD/SPI line high-Z while v_periph is off. With an inserted
+	 * card, even one still-driven line can clamp the shared rail near a diode
+	 * drop and prevent the codec from seeing a true cold start.
+	 */
+	power_ctrl_gpio_disconnect(&spi3_sck_gpio, "spi3_sck");
+	power_ctrl_gpio_disconnect(&spi3_mosi_gpio, "spi3_mosi");
+	power_ctrl_gpio_disconnect(&spi3_miso_gpio, "spi3_miso");
+	/* LoRa is powered outside v_periph on this hardware. Keep active-low
+	 * NSS pulled high during suspend so the radio cannot float selected and
+	 * disturb the shared SPI/SD lines.
+	 */
+	power_ctrl_gpio_pull_up_and_hold_lp(&spi3_cs_lora, "spi3_cs_lora");
+	/* Keep SD CS high-Z while v_periph is off so an inserted card is not
+	 * selected or back-fed through IO clamps.
+	 */
 	power_ctrl_gpio_disconnect(&spi3_cs_sd, "spi3_cs_sd");
+	power_ctrl_gpio_disconnect(&sd_cd_gpio, "sd_cd");
+	/* Keep LoRa module out of reset during suspend. */
 	power_ctrl_gpio_disconnect(&lora_reset, "lora_reset");
-	power_ctrl_gpio_disconnect(&lora_busy, "lora_busy");
-	power_ctrl_gpio_disconnect(&lora_rxen, "lora_rxen");
-	power_ctrl_gpio_disconnect(&lora_dio1, "lora_dio1");
-	*/
+	power_ctrl_gpio_force_low_and_hold_lp(&lora_rxen, "lora_rxen");
 
 	power_ctrl_gpio_disconnect(&lora_busy, "lora_busy");
 	power_ctrl_gpio_disconnect(&lora_dio1, "lora_dio1");
@@ -349,6 +451,7 @@ static void power_ctrl_restore_vperiph_gpio(void)
 	/* power_ctrl_gpio_restore_output_inactive(&spi3_mosi_gpio, "spi3_mosi"); */
 	power_ctrl_gpio_restore_output_inactive(&spi3_cs_lora, "spi3_cs_lora");
 	power_ctrl_gpio_restore_output_inactive(&spi3_cs_sd, "spi3_cs_sd");
+	power_ctrl_gpio_restore_input(&sd_cd_gpio, "sd_cd");
 	power_ctrl_gpio_restore_output_inactive(&lora_reset, "lora_reset");
 	power_ctrl_gpio_restore_input(&lora_busy, "lora_busy");
 	power_ctrl_gpio_restore_output_inactive(&lora_rxen, "lora_rxen");
@@ -392,50 +495,65 @@ static void power_ctrl_restore_full_vperiph_io(void)
 	vperiph_io_parked = false;
 }
 
+static void power_ctrl_restore_requested_vperiph_io(bool restore_full_io, bool restore_i2c1_only,
+						    bool restore_i2c2_only)
+{
+	if (restore_full_io) {
+		power_ctrl_restore_full_vperiph_io();
+		return;
+	}
+
+	if (restore_i2c1_only) {
+		power_ctrl_restore_i2c1_only();
+	}
+	if (restore_i2c2_only) {
+		power_ctrl_restore_i2c2_only();
+	}
+}
+
 /**
  * @brief Common helper to enable v_periph with selective IO restoration.
  *
  * @param restore_full_io Restore all parked IO resources when true.
  * @param restore_i2c1_only Restore only I2C1 pinctrl when true.
  * @param restore_i2c2_only Restore only I2C2 pinctrl when true.
- * @return 0 on success, negative errno on failure.
+ * @return 1 if the rail was physically enabled, 0 if it was already on, negative errno on failure.
  */
 static int power_ctrl_vperiph_enable_common(bool restore_full_io, bool restore_i2c1_only,
 					   bool restore_i2c2_only)
 {
-	if (!vperiph_en.port || !gpio_is_ready_dt(&vperiph_en)) {
-		LOG_WRN("v_periph enable GPIO not ready");
-		return -ENODEV;
-	}
+	bool was_powered = vperiph_powered;
 
-	if (restore_full_io) {
-		power_ctrl_restore_full_vperiph_io();
-	} else {
-		if (restore_i2c1_only) {
-			power_ctrl_restore_i2c1_only();
-		}
-		if (restore_i2c2_only) {
-			power_ctrl_restore_i2c2_only();
+	if (!vperiph_powered && (vperiph_off_at_ms != 0U)) {
+		uint32_t off_ms = k_uptime_get_32() - vperiph_off_at_ms;
+
+		if (off_ms < VPERIPH_MIN_OFF_MS) {
+			k_msleep(VPERIPH_MIN_OFF_MS - off_ms);
 		}
 	}
 
-	int ret = gpio_pin_configure_dt(&vperiph_en, GPIO_OUTPUT_ACTIVE);
+	int ret = power_ctrl_gpio_configure_set_high(&vperiph_en, "v_periph_on_off");
 	if (ret < 0) {
-		LOG_ERR("v_periph GPIO configure failed: %d", ret);
 		return ret;
 	}
-
-	ret = gpio_pin_set_dt(&vperiph_en, 1);
-	if (ret < 0) {
-		LOG_ERR("v_periph GPIO set HIGH failed: %d", ret);
-		return ret;
+	if (sd_on_gpio.port != NULL) {
+		ret = power_ctrl_gpio_configure_set_high(&sd_on_gpio, "sd_on_off");
+		if (ret < 0) {
+			return ret;
+		}
 	}
 
-	/* Codec (ADC3101) 等外设在上电后需要更长一点时间稳定，避免刚上电即访问 I2C */
-	k_msleep(250);
+	vperiph_powered = true;
+
+	if (!was_powered) {
+		k_msleep(VPERIPH_RAIL_SETTLE_MS);
+	}
+
+	power_ctrl_restore_requested_vperiph_io(restore_full_io, restore_i2c1_only,
+						restore_i2c2_only);
 
 	LOG_INF("v_periph enabled");
-	return 0;
+	return was_powered ? 0 : 1;
 }
 
 /**
@@ -443,6 +561,10 @@ static int power_ctrl_vperiph_enable_common(bool restore_full_io, bool restore_i
  */
 static void power_ctrl_gps_vbckp_low(void)
 {
+	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED) {
+		return;
+	}
+
 	power_ctrl_gpio_force_low_and_hold_lp(&gps_vbckp, "gps_vbckp");
 }
 
@@ -451,6 +573,10 @@ static void power_ctrl_gps_vbckp_low(void)
  */
 static void power_ctrl_gps_vbckp_high(void)
 {
+	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED) {
+		return;
+	}
+
 	if (!gps_vbckp.port || !gpio_is_ready_dt(&gps_vbckp)) {
 		return;
 	}
@@ -512,10 +638,6 @@ static void power_ctrl_try_apply_default_pinctrl(const struct pinctrl_dev_config
  */
 static void power_ctrl_park_vperiph_io(void)
 {
-	if (vperiph_io_parked) {
-		return;
-	}
-
 	power_ctrl_spi3_suspend_fallback();
 	power_ctrl_park_vperiph_gpio();
 	power_ctrl_try_apply_sleep_pinctrl(sai1b_pcfg, "sai1_b");
@@ -528,7 +650,7 @@ static void power_ctrl_park_vperiph_io(void)
 /**
  * @brief Enable v_periph and restore full runtime IO configuration.
  *
- * @return 0 on success, negative errno on failure.
+ * @return 1 if the rail was physically enabled, 0 if it was already on, negative errno on failure.
  */
 int power_ctrl_vperiph_on(void)
 {
@@ -538,7 +660,7 @@ int power_ctrl_vperiph_on(void)
 /**
  * @brief Enable v_periph and restore only resources needed by I2C1.
  *
- * @return 0 on success, negative errno on failure.
+ * @return 1 if the rail was physically enabled, 0 if it was already on, negative errno on failure.
  */
 int power_ctrl_vperiph_on_for_i2c1(void)
 {
@@ -548,7 +670,7 @@ int power_ctrl_vperiph_on_for_i2c1(void)
 /**
  * @brief Enable v_periph and restore only resources needed by I2C2.
  *
- * @return 0 on success, negative errno on failure.
+ * @return 1 if the rail was physically enabled, 0 if it was already on, negative errno on failure.
  */
 int power_ctrl_vperiph_on_for_i2c2(void)
 {
@@ -576,12 +698,15 @@ int power_ctrl_vperiph_off(void)
 	*/
 
 	if (!vperiph_en.port || !gpio_is_ready_dt(&vperiph_en)) {
-		LOG_WRN("v_periph enable GPIO not ready");
+		LOG_WRN("v_periph_on_off GPIO not ready");
 		return -ENODEV;
 	}
 
 	power_ctrl_park_vperiph_io();
+	power_ctrl_gpio_force_low_and_hold_lp(&sd_on_gpio, "sd_on_off");
 	power_ctrl_gpio_force_low_and_hold_lp(&vperiph_en, "v_periph_en");
+	vperiph_powered = false;
+	vperiph_off_at_ms = k_uptime_get_32();
 
 	LOG_INF("v_periph disabled");
 	return 0;
@@ -597,6 +722,11 @@ int power_ctrl_vperiph_off(void)
  */
 int power_ctrl_gps_on(void)
 {
+	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED) {
+		LOG_INF("Microphone debug mode: skip GPS power on");
+		return 0;
+	}
+
 	int ret = power_ctrl_vperiph_on_for_i2c1();
 	if ((ret < 0) && (ret != -ENODEV)) {
 		LOG_ERR("v_periph enable before GPS main power failed: %d", ret);
@@ -634,6 +764,11 @@ int power_ctrl_gps_on(void)
  */
 int power_ctrl_gps_off(void)
 {
+	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED) {
+		LOG_INF("Microphone debug mode: skip GPS power off");
+		return 0;
+	}
+
 	power_ctrl_gpio_force_low_and_hold_lp(&gps_en, "gps_on_off");
 	power_ctrl_gps_vbckp_low();
 	LOG_INF("GPS main power disabled");
@@ -647,11 +782,20 @@ int power_ctrl_gps_off(void)
  */
 int power_ctrl_prepare_suspend(void)
 {
-	task_storage_prepare_sleep();
+	task_status_led_prepare_sleep();
 	task_microphone_prepare_sleep();
+	task_storage_pcm_end();
+	task_sd_mount_async_cancel();
+	task_dfu_check_and_apply_periodic();
+	int storage_ret = task_storage_prepare_sleep();
 	task_inference_prepare_sleep();
-	task_lorawan_prepare_sleep();
 	task_gps_prepare_sleep();
+	task_sensor_prepare_sleep();
+
+	if (storage_ret < 0) {
+		LOG_WRN("Suspend prep keeps v_periph on: storage not safe (%d)", storage_ret);
+		return storage_ret;
+	}
 
 	int ret = power_ctrl_vperiph_off();
 	if ((ret < 0) && (ret != -ENODEV)) {
@@ -664,11 +808,15 @@ int power_ctrl_prepare_suspend(void)
 /**
  * @brief Prepare the system for deep sleep with all major peripherals off.
  *
- * @return Always returns 0.
+ * @return 0 on success, negative errno on failure.
  */
 int power_ctrl_prepare_deep_sleep_all(void)
 {
-	power_ctrl_prepare_suspend();
+	int ret = power_ctrl_prepare_suspend();
+	if (ret < 0) {
+		return ret;
+	}
+	task_lorawan_prepare_sleep();
 	power_ctrl_gps_vbckp_low();
 	task_sound_wakeup_prepare_sleep();
 	return 0;

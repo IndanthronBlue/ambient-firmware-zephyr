@@ -34,10 +34,9 @@
 		zephyr,retained-mem = &app_retention;
 	};
 
-	retained_region: sram@28003c00 {
-		compatible = "zephyr,memory-region", "mmio-sram";
-		reg = <0x28003c00 0x400>;
-		zephyr,memory-region = "RetainedMem";
+	retained_region: backup-retention@40036400 {
+		compatible = "mmio-sram";
+		reg = <0x40036400 0x400>;
 		status = "okay";
 		#address-cells = <1>;
 		#size-cells = <1>;
@@ -58,6 +57,10 @@
 			};
 		};
 	};
+};
+
+&backup_sram {
+	status = "okay";
 };
 
 &{/soc/pin-controller@42020000} {
@@ -121,6 +124,21 @@
 &gpioa {
 	status = "okay";
 	wakeup-source;
+};
+
+&gpiob {
+	status = "okay";
+};
+
+&gpioc {
+	status = "okay";
+	wakeup-source;
+};
+
+&power_ctrl_pins {
+	compatible = "bird,power-ctrl-pins";
+	spi3-miso-gpios = <&gpioc 11 GPIO_ACTIVE_HIGH>;
+	sd-cd-gpios = <&gpioa 8 GPIO_ACTIVE_HIGH>;
 };
 
 &i2c1 {

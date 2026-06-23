@@ -1,0 +1,24 @@
+description: Ambient board auxiliary power-control GPIO pins
+
+compatible: "bird,power-ctrl-pins"
+
+properties:
+  sd-on-gpios:
+    type: phandle-array
+    description: SD_ON_OFF / peripheral rail companion enable GPIO
+
+  spi3-sck-gpios:
+    type: phandle-array
+    description: SPI3 SCK GPIO used for low-power parking
+
+  spi3-mosi-gpios:
+    type: phandle-array
+    description: SPI3 MOSI GPIO used for low-power parking
+
+  spi3-miso-gpios:
+    type: phandle-array
+    description: SPI3 MISO GPIO used for low-power parking
+
+  sd-cd-gpios:
+    type: phandle-array
+    description: SD card-detect GPIO used for low-power parking

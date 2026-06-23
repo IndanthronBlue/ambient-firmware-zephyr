@@ -15,8 +15,9 @@
 
 LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 
-#define APP_BOOT_COLD_POWERCYCLE_MS 250U
-#define APP_DEEP_SLEEP_WAKE_SEC     (3U * 60U * 60U)
+#define APP_BOOT_COLD_POWERCYCLE_MS 1000U
+#define APP_DEEP_SLEEP_WAKE_SEC     (1U * 60U * 60U)
+// #define APP_DEEP_SLEEP_WAKE_SEC     (30U)
 #define APP_BOOT_GPS_SYNC_TIMEOUT_MS (3U * 60U * 1000U)
 #define APP_BOOT_GPS_RETRY_DELAY_MS  5000U
 
@@ -106,10 +107,19 @@ static void enter_deep_sleep_or_simulate(void)
 {
 	int alarm_ret = task_rtc_set_alarm_in_seconds(APP_DEEP_SLEEP_WAKE_SEC);
 	LOG_INF("[PWR] low-bat recovery RTC alarm ret=%d", alarm_ret);
+	if (alarm_ret < 0) {
+		LOG_ERR("[PWR] low-bat recovery abort: rtc alarm setup failed, skip sys_poweroff");
+		return;
+	}
 
 	if (APP_DEEP_SLEEP_ENABLED && !APP_DEEP_SLEEP_SIMULATE_ENABLED) {
 		LOG_INF("[PWR] Entering deep sleep by sys_poweroff() -> STM32U5 shutdown");
-		power_ctrl_prepare_deep_sleep_all();
+		int prep_ret = power_ctrl_prepare_deep_sleep_all();
+		if (prep_ret < 0) {
+			LOG_ERR("[PWR] low-bat recovery abort: hardware prepare failed: %d, skip sys_poweroff",
+				prep_ret);
+			return;
+		}
 		task_rtc_prepare_shutdown_wakeup_route();
 		k_msleep(200);
 		sys_poweroff();
@@ -126,7 +136,7 @@ static bool is_gps_time_legal(void)
 	uint32_t now_epoch = 0U;
 	struct retained_state_v1 retained;
 
-	if (task_rtc_get_epoch_utc(&now_epoch) < 0) {
+	if (task_rtc_get_epoch_local(&now_epoch) < 0) {
 		return false;
 	}
 
@@ -143,6 +153,11 @@ static bool is_gps_time_legal(void)
 
 static void ensure_boot_gps_time_blocking(void)
 {
+	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED) {
+		LOG_INF("[BOOT] microphone debug mode: skip blocking GPS time sync");
+		return;
+	}
+
 	uint32_t start_ms = k_uptime_get_32();
 
 	while ((k_uptime_get_32() - start_ms) < APP_BOOT_GPS_SYNC_TIMEOUT_MS) {
@@ -152,7 +167,7 @@ static void ensure_boot_gps_time_blocking(void)
 
 		LOG_INF("[BOOT] GPS time sync attempt start (remain=%u ms)",
 			(unsigned int)remain_ms);
-		if (task_gps_acquire_with_timeout(remain_ms, &rtc_synced) && rtc_synced &&
+		if (task_gps_acquire_with_timeout_main_alive(remain_ms, &rtc_synced) && rtc_synced &&
 		    is_gps_time_legal()) {
 			LOG_INF("[BOOT] GPS legal time ready");
 			return;
@@ -178,6 +193,12 @@ static bool app_boot_is_shutdown_wake_reboot(bool reset_cause_valid, uint32_t re
 
 int main(void)
 {
+	// k_sleep(K_SECONDS(3));
+	// (void)task_rtc_init();
+
+	// // 直接进入休眠，不进入正常的active运行态，来验证RTC唤醒和低电压唤醒功能
+	// enter_deep_sleep_or_simulate();
+
 	app_pm_boot_guard_lock();
 
 	uint32_t reset_cause = 0U;
@@ -195,6 +216,8 @@ int main(void)
 		APP_DEEP_SLEEP_ENABLED,
 		APP_RETENTION_ENABLED,
 		APP_DEEP_SLEEP_SIMULATE_ENABLED);
+	LOG_INF("Debug flags: mic_skip_gps_lora=%d",
+		APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED);
 	LOG_INF("Wake source flags: button=%d periodic=%d comm=%d rtc=%d sound=%d low_bat=%d",
 		APP_WAKEUP_SRC_BUTTON_ENABLED,
 		APP_WAKEUP_SRC_PERIODIC_ENABLED,
@@ -207,6 +230,13 @@ int main(void)
 			(unsigned int)reset_cause,
 			(reset_cause & RESET_LOW_POWER_WAKE) != 0U ? 1 : 0,
 			app_boot_is_shutdown_wake_reboot(reset_cause_valid, reset_cause) ? 1 : 0);
+		LOG_INF("[BOOT] reset flags: pin=%d software=%d brownout=%d por=%d watchdog=%d debug=%d",
+			(reset_cause & RESET_PIN) != 0U ? 1 : 0,
+			(reset_cause & RESET_SOFTWARE) != 0U ? 1 : 0,
+			(reset_cause & RESET_BROWNOUT) != 0U ? 1 : 0,
+			(reset_cause & RESET_POR) != 0U ? 1 : 0,
+			(reset_cause & RESET_WATCHDOG) != 0U ? 1 : 0,
+			(reset_cause & RESET_DEBUG) != 0U ? 1 : 0);
 	}
 	log_boot_self_check();
 
@@ -221,7 +251,39 @@ int main(void)
 		LOG_INF("[BOOT] Detected RTC/deep-sleep shutdown wake reboot; boot flow restarts from main()");
 	}
 
+	/* Cold power-cycle before codec/mic init to discharge
+	 * v_periph rail and start ADC3101 from a clean state.
+	 */
+	(void)power_ctrl_vperiph_off();
+	k_msleep(APP_BOOT_COLD_POWERCYCLE_MS);
+	(void)power_ctrl_vperiph_on();
+	(void)task_status_led_init();
+
+	if (task_ina3221_init() < 0) {
+		LOG_ERR("INA3221 worker init failed");
+	}
+
+	if (task_ina3221_read_now() == 0) {
+		int32_t batt_mv = (int32_t)(app_state.ina_ch2_voltage_v * 1000.0f);
+		LOG_INF("[BOOT] battery after wake = %d mV", (int)batt_mv);
+		if (batt_mv < APP_LOW_BATTERY_MV) {
+			LOG_WRN("[BOOT] battery still low after wake, re-enter shutdown");
+			enter_deep_sleep_or_simulate();
+			return 0;
+		}
+	}
+
 	(void)task_rtc_init();
+
+	if (APP_RETENTION_ENABLED) {
+		int retained_ret = retained_state_init_or_reset();
+		if (retained_ret < 0) {
+			LOG_WRN("[BOOT] retained_state_init_or_reset failed: %d", retained_ret);
+		}
+	}
+	task_storage_sd_fuse_init();
+
+	LOG_INF("[BOOT] defer synchronous SD mount until watchdog is active");
 
 	(void)task_comm_init();
 
@@ -237,13 +299,6 @@ int main(void)
 		LOG_INF("[PWR] sound wakeup source disabled by config");
 	}
 
-	/* Arduino-style cold power-cycle before codec/mic init to discharge
-	 * v_periph rail and start ADC3101 from a clean state.
-	 */
-	(void)power_ctrl_vperiph_off();
-	k_msleep(APP_BOOT_COLD_POWERCYCLE_MS);
-	(void)power_ctrl_vperiph_on();
-
 	uint32_t mic_init_start_ms = k_uptime_get_32();
 	
 	int mic_init_ret = task_microphone_init();
@@ -256,12 +311,6 @@ int main(void)
 		LOG_ERR("Mic init failed");
 	}
 
-	uint32_t sd_init_start_ms = k_uptime_get_32();
-	task_sd_ensure_mounted();
-	uint32_t sd_init_cost_ms = k_uptime_get_32() - sd_init_start_ms;
-	LOG_INF("[BOOT] sd ensure mounted cost=%u ms", (unsigned int)sd_init_cost_ms);
-
-	task_dfu_check_and_apply();
 	task_sensor_sample();
 
 	
@@ -270,35 +319,45 @@ int main(void)
 	// }
 	// task_imu_sample();
 
-	if (task_lorawan_connect() != 0) {
+	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED) {
+		LOG_INF("[BOOT] microphone debug mode: skip startup LoRaWAN connect");
+	} else if (task_lorawan_connect() != 0) {
 		LOG_WRN("Startup LoRaWAN connect failed; will retry during runtime");
 	}
 
-	if (task_ina3221_init() < 0) {
-		LOG_ERR("INA3221 worker init failed");
+	int wdt_ret = task_watchdog_init();
+	if (wdt_ret == 0) {
+		LOG_INF("[BOOT] All devices initialized; watchdog active");
+	} else {
+		LOG_WRN("[BOOT] All devices initialized; watchdog inactive (init ret=%d)", wdt_ret);
 	}
 
-	(void)task_watchdog_init();
-	LOG_INF("[BOOT] All devices initialized; watchdog active");
-
-	if (APP_RETENTION_ENABLED) {
-		int retained_ret = retained_state_init_or_reset();
-		if (retained_ret < 0) {
-			LOG_WRN("[BOOT] retained_state_init_or_reset failed: %d", retained_ret);
-		}
+	if (wdt_ret == 0) {
+		task_watchdog_mark_main_alive();
+		uint32_t sd_init_start_ms = k_uptime_get_32();
+		task_sd_ensure_mounted();
+		uint32_t sd_init_cost_ms = k_uptime_get_32() - sd_init_start_ms;
+		task_watchdog_mark_main_alive();
+		LOG_INF("[BOOT] watchdog-protected SD ensure mounted cost=%u ms mounted=%u fuse=%u",
+			(unsigned int)sd_init_cost_ms,
+			(unsigned int)(app_state.sd_mounted ? 1U : 0U),
+			(unsigned int)(task_storage_sd_fuse_active() ? 1U : 0U));
+		task_dfu_check_and_apply();
+		task_watchdog_mark_main_alive();
+	} else {
+		LOG_WRN("[BOOT] skip synchronous SD mount/DFU because watchdog is inactive");
 	}
 
-	if (task_ina3221_read_now() == 0) {
-		int32_t batt_mv = (int32_t)(app_state.ina_ch2_voltage_v * 1000.0f);
-		LOG_INF("[BOOT] battery after wake = %d mV", (int)batt_mv);
-		if (batt_mv < APP_LOW_BATTERY_MV) {
-			LOG_WRN("[BOOT] battery still low after wake, re-enter shutdown");
-			enter_deep_sleep_or_simulate();
-			return 0;
-		}
+	uint32_t now_epoch = 0U;
+	if (task_rtc_get_epoch_local(&now_epoch) < 0) {
+		LOG_WRN("[PWR] GPS resync check failed to get RTC local epoch");
+		ensure_boot_gps_time_blocking();
+	} else {
+		LOG_INF("[BOOT] RTC local epoch read at startup: %u", (unsigned int)now_epoch);
 	}
-	
-	ensure_boot_gps_time_blocking();
+
+	task_status_led_event(STATUS_LED_BOOT_OK);
+	k_msleep(150);
 
 	if (power_fsm_init() < 0) {
 		LOG_ERR("power_fsm_init failed");
@@ -309,7 +368,9 @@ int main(void)
 	LOG_INF("[BOOT] Init complete, entering normal runtime");
 
 	while (1) {
+		task_watchdog_mark_main_alive();
 		power_fsm_tick();
+		task_watchdog_mark_main_alive();
 		k_timeout_t timeout = power_fsm_next_wait_timeout();
 		uint32_t timeout_ms = k_ticks_to_ms_floor32(timeout.ticks);
 		LOG_INF("Power FSM waiting for event or timeout (%u ms)",
