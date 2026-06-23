@@ -20,12 +20,14 @@ static bool ina_initialized = false;
 static bool ina_thread_started = false;
 
 static atomic_t ina_active_guard;
+static atomic_t ina_read_busy;
 
 static struct k_thread ina_thread_data;
 K_THREAD_STACK_DEFINE(ina_thread_stack, 1024);
 
 #define INA_MONITOR_PERIOD_MS 30000
 #define INA_STARTUP_DELAY_MS 30000
+#define INA_IDLE_WAIT_SLICE_MS 5
 #define INA_THREAD_PRIO K_IDLE_PRIO
 
 /* Attribute alias to avoid magic number usage (driver-private) */
@@ -104,7 +106,30 @@ static int read_current_ma(float *out_ma)
 
 void task_ina3221_block_active(bool block)
 {
-    atomic_set(&ina_active_guard, block ? 1 : 0);
+	if (block) {
+		atomic_inc(&ina_active_guard);
+		return;
+	}
+
+	if (atomic_get(&ina_active_guard) > 0) {
+		atomic_dec(&ina_active_guard);
+	}
+}
+
+bool task_ina3221_wait_idle(uint32_t timeout_ms)
+{
+	uint32_t waited_ms = 0U;
+
+	while (atomic_get(&ina_read_busy) != 0) {
+		if (waited_ms >= timeout_ms) {
+			return false;
+		}
+
+		k_msleep(INA_IDLE_WAIT_SLICE_MS);
+		waited_ms += INA_IDLE_WAIT_SLICE_MS;
+	}
+
+	return true;
 }
 
 void task_ina3221_monitor(void)
@@ -205,16 +230,25 @@ static void ina_worker_thread(void *a, void *b, void *c)
     ARG_UNUSED(b);
     ARG_UNUSED(c);
 
-    /* Avoid racing boot-time peripheral bring-up / early suspend transitions.
-     * The INA worker can power-cycle v_periph when the system is not ACTIVE,
-     * which is disruptive if started immediately from main().
-     */
+    /* Avoid racing boot-time peripheral bring-up before the FSM owns power policy. */
     k_msleep(INA_STARTUP_DELAY_MS);
 
     while (1) {
         bool powered_for_ina = false;
+        bool opened_in_suspend = false;
+        power_state_t state = power_fsm_get_state();
 
-        if (atomic_get(&ina_active_guard) != 0) {
+        if ((atomic_get(&ina_active_guard) != 0) ||
+	    ((state != POWER_STATE_ACTIVE) && (state != POWER_STATE_SUSPEND))) {
+            k_msleep(INA_MONITOR_PERIOD_MS);
+            continue;
+        }
+
+        atomic_set(&ina_read_busy, 1);
+        state = power_fsm_get_state();
+        if ((atomic_get(&ina_active_guard) != 0) ||
+	    ((state != POWER_STATE_ACTIVE) && (state != POWER_STATE_SUSPEND))) {
+            atomic_set(&ina_read_busy, 0);
             k_msleep(INA_MONITOR_PERIOD_MS);
             continue;
         }
@@ -222,18 +256,23 @@ static void ina_worker_thread(void *a, void *b, void *c)
         int power_ret = power_ctrl_vperiph_on_for_i2c2();
         if (power_ret < 0) {
             LOG_WRN("INA3221 power-on before background read failed: %d", power_ret);
+            atomic_set(&ina_read_busy, 0);
             k_msleep(INA_MONITOR_PERIOD_MS);
             continue;
         }
-        powered_for_ina = true;
+        powered_for_ina = power_ret > 0;
+        opened_in_suspend = powered_for_ina && (state == POWER_STATE_SUSPEND);
 
         if (atomic_get(&ina_active_guard) == 0) {
             task_ina3221_monitor();
         }
 
-        if (powered_for_ina && atomic_get(&ina_active_guard) == 0) {
+        if (opened_in_suspend &&
+	    (atomic_get(&ina_active_guard) == 0) &&
+	    (power_fsm_get_state() == POWER_STATE_SUSPEND)) {
             (void)power_ctrl_vperiph_off();
         }
+        atomic_set(&ina_read_busy, 0);
 
         k_msleep(INA_MONITOR_PERIOD_MS);
     }
