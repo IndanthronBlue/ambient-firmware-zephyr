@@ -39,16 +39,21 @@ static const struct device *gps_i2c = DEVICE_DT_GET(DT_NODELABEL(i2c1));
 
 /* Internal state */
 static bool initialized = false;
+static bool gps_powered = false;
 static uint32_t init_fail_count = 0;
 static uint32_t retry_deadline_ms = 0;
 static uint8_t nmea_buf[255];
 static char line_buf[128];
 static size_t line_len = 0;
+static bool gps_debug_skip_logged;
+static bool gps_last_rtc_sync_ok;
 K_MUTEX_DEFINE(gps_i2c1_mutex);
 
 #define GPS_RETRY_5MIN_MS   (5U * 60U * 1000U)
 #define GPS_RETRY_10MIN_MS  (10U * 60U * 1000U)
 #define GPS_RETRY_30MIN_MS  (30U * 60U * 1000U)
+
+static void gps_power_off(void);
 
 static uint32_t gps_backoff_ms(uint32_t fail_count)
 {
@@ -59,6 +64,16 @@ static uint32_t gps_backoff_ms(uint32_t fail_count)
 		return GPS_RETRY_10MIN_MS;
 	}
 	return GPS_RETRY_30MIN_MS;
+}
+
+static void gps_log_microphone_debug_skip(const char *operation)
+{
+	if (!gps_debug_skip_logged) {
+		LOG_INF("Microphone debug mode enabled: GPS real operations are skipped");
+		gps_debug_skip_logged = true;
+	}
+
+	LOG_DBG("Microphone debug mode: GPS %s skipped", operation);
 }
 
 void task_i2c1_lock(void)
@@ -82,19 +97,26 @@ static void gps_mark_failure(uint32_t now_ms, const char *reason)
 
 static int gps_power_on(void)
 {
+	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED) {
+		gps_log_microphone_debug_skip("power on");
+		return -ENOTSUP;
+	}
+
     int ret = power_ctrl_gps_on();
     if (ret < 0) {
         return ret;
     }
+	gps_powered = true;
 
     /* Wait GPS startup; keep longer for runtime re-power validation */
     k_msleep(2000);
 
-    /* Initialize I2C (verify bus ready) */
-    if (!device_is_ready(gps_i2c)) {
-        LOG_ERR("GPS I2C1 device not ready");
-        return -ENODEV;
-    }
+	/* Initialize I2C (verify bus ready) */
+	if (!device_is_ready(gps_i2c)) {
+		LOG_ERR("GPS I2C1 device not ready");
+		gps_power_off();
+		return -ENODEV;
+	}
 
     task_i2c1_lock();
     (void)i2c_recover_bus(gps_i2c);
@@ -105,7 +127,17 @@ static int gps_power_on(void)
 static void gps_power_off(void)
 {
 	initialized = false;
+	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED) {
+		gps_log_microphone_debug_skip("power off");
+		return;
+	}
+
+	if (!gps_powered) {
+		return;
+	}
+
 	(void)power_ctrl_gps_off();
+	gps_powered = false;
 }
 
 static bool gps_is_leap_year(int year)
@@ -135,35 +167,178 @@ static uint8_t gps_days_in_month(int year, int month)
 	return days;
 }
 
-static void gps_apply_local_hour_offset(int *year, int *month, int *day, int *hour, int offset_hours)
+static bool gps_datetime_valid(int year, int month, int day,
+			       int hour, int minute, int second)
 {
-	*hour += offset_hours;
-
-	while (*hour >= 24) {
-		*hour -= 24;
-		(*day)++;
-		if (*day > gps_days_in_month(*year, *month)) {
-			*day = 1;
-			(*month)++;
-			if (*month > 12) {
-				*month = 1;
-				(*year)++;
-			}
-		}
+	if ((year < 2000) || (month < 1) || (month > 12) ||
+	    (day < 1) || (hour < 0) || (hour > 23) ||
+	    (minute < 0) || (minute > 59) ||
+	    (second < 0) || (second > 59)) {
+		return false;
 	}
 
-	while (*hour < 0) {
-		*hour += 24;
-		(*day)--;
-		if (*day < 1) {
-			(*month)--;
-			if (*month < 1) {
-				*month = 12;
-				(*year)--;
-			}
-			*day = gps_days_in_month(*year, *month);
-		}
+	return day <= gps_days_in_month(year, month);
+}
+
+static bool gps_datetime_to_epoch_utc(int year, int month, int day,
+				      int hour, int minute, int second,
+				      uint32_t *epoch)
+{
+	if ((epoch == NULL) ||
+	    !gps_datetime_valid(year, month, day, hour, minute, second)) {
+		return false;
 	}
+
+	uint32_t days = 0U;
+	for (int y = 1970; y < year; y++) {
+		days += gps_is_leap_year(y) ? 366U : 365U;
+	}
+
+	for (int m = 1; m < month; m++) {
+		days += gps_days_in_month(year, m);
+	}
+
+	days += (uint32_t)(day - 1);
+
+	uint64_t seconds = ((uint64_t)days * 86400ULL) +
+		((uint64_t)hour * 3600ULL) +
+		((uint64_t)minute * 60ULL) +
+		(uint64_t)second;
+	if (seconds > UINT32_MAX) {
+		return false;
+	}
+
+	*epoch = (uint32_t)seconds;
+	return true;
+}
+
+static bool gps_epoch_to_datetime(uint32_t epoch, int *year, int *month,
+				  int *day, int *hour, int *minute,
+				  int *second)
+{
+	if ((year == NULL) || (month == NULL) || (day == NULL) ||
+	    (hour == NULL) || (minute == NULL) || (second == NULL)) {
+		return false;
+	}
+
+	uint32_t days = epoch / 86400U;
+	uint32_t rem = epoch % 86400U;
+
+	*hour = (int)(rem / 3600U);
+	rem %= 3600U;
+	*minute = (int)(rem / 60U);
+	*second = (int)(rem % 60U);
+
+	int y = 1970;
+	while (true) {
+		uint32_t ydays = gps_is_leap_year(y) ? 366U : 365U;
+		if (days < ydays) {
+			break;
+		}
+		days -= ydays;
+		y++;
+	}
+
+	int m = 1;
+	while (m <= 12) {
+		uint32_t mdays = gps_days_in_month(y, m);
+		if (days < mdays) {
+			break;
+		}
+		days -= mdays;
+		m++;
+	}
+
+	*year = y;
+	*month = m;
+	*day = (int)days + 1;
+	return true;
+}
+
+static uint8_t gps_weekday_sunday0(int year, int month, int day)
+{
+	uint32_t epoch = 0U;
+	if (!gps_datetime_to_epoch_utc(year, month, day, 0, 0, 0, &epoch)) {
+		return 0U;
+	}
+
+	/* 1970-01-01 was Thursday (4 with Sunday=0). */
+	return (uint8_t)(((epoch / 86400U) + 4U) % 7U);
+}
+
+static uint8_t gps_last_sunday_day(int year, int month)
+{
+	uint8_t day = gps_days_in_month(year, month);
+	while (gps_weekday_sunday0(year, month, day) != 0U) {
+		day--;
+	}
+	return day;
+}
+
+static int32_t gps_france_utc_offset_seconds(int year, int month, int day,
+					     int hour, int minute, int second)
+{
+	if ((month < 3) || (month > 10)) {
+		return 3600;
+	}
+
+	if ((month > 3) && (month < 10)) {
+		return 7200;
+	}
+
+	uint8_t switch_day = gps_last_sunday_day(year, month);
+	uint32_t sec_of_day = ((uint32_t)hour * 3600U) +
+		((uint32_t)minute * 60U) +
+		(uint32_t)second;
+
+	/* Europe/Paris switches at 01:00 UTC on the last Sunday of March/October. */
+	if (month == 3) {
+		if ((day > switch_day) ||
+		    ((day == switch_day) && (sec_of_day >= 3600U))) {
+			return 7200;
+		}
+		return 3600;
+	}
+
+	if ((day < switch_day) ||
+	    ((day == switch_day) && (sec_of_day < 3600U))) {
+		return 7200;
+	}
+	return 3600;
+}
+
+static bool gps_utc_to_france_local(int utc_year, int utc_month, int utc_day,
+				    int utc_hour, int utc_minute,
+				    int utc_second, int *local_year,
+				    int *local_month, int *local_day,
+				    int *local_hour, int *local_minute,
+				    int *local_second, int32_t *offset_sec)
+{
+	uint32_t utc_epoch = 0U;
+	if (!gps_datetime_to_epoch_utc(utc_year, utc_month, utc_day,
+				       utc_hour, utc_minute, utc_second,
+				       &utc_epoch)) {
+		return false;
+	}
+
+	int32_t offset = gps_france_utc_offset_seconds(utc_year, utc_month,
+						      utc_day, utc_hour,
+						      utc_minute, utc_second);
+	uint64_t local_epoch = (uint64_t)utc_epoch + (uint64_t)offset;
+	if (local_epoch > UINT32_MAX) {
+		return false;
+	}
+
+	if (!gps_epoch_to_datetime((uint32_t)local_epoch, local_year,
+				   local_month, local_day, local_hour,
+				   local_minute, local_second)) {
+		return false;
+	}
+
+	if (offset_sec != NULL) {
+		*offset_sec = offset;
+	}
+	return true;
 }
 
 static float nmea_coord_to_decimal(const char *s)
@@ -256,23 +431,52 @@ static bool parse_rmc_line(const char *line, float *plat, float *plon)
     if (ns == 'S') lat = -lat;
     if (ew == 'W') lon = -lon;
 
-    if ((utc_hour >= 0) && (utc_minute >= 0) && (utc_second >= 0) &&
-        (date_day > 0) && (date_month > 0) && (date_year >= 2000)) {
-        gps_apply_local_hour_offset(&date_year, &date_month, &date_day,
-                                    &utc_hour, APP_GPS_LOCAL_TIME_OFFSET_HOURS);
-        app_state.time_hour = (uint8_t)utc_hour;
-        app_state.time_minute = (uint8_t)utc_minute;
-        app_state.time_second = (uint8_t)utc_second;
-        app_state.time_day = (uint8_t)date_day;
-        app_state.time_month = (uint8_t)date_month;
-        app_state.time_year = (uint16_t)date_year;
-        LOG_INF("GPS RMC date: %04u-%02u-%02u", (unsigned int)app_state.time_year,
-                (unsigned int)app_state.time_month, (unsigned int)app_state.time_day);
+    app_state.time_valid = false;
+    if (gps_datetime_valid(date_year, date_month, date_day,
+                           utc_hour, utc_minute, utc_second)) {
+	int local_year = 0;
+	int local_month = 0;
+	int local_day = 0;
+	int local_hour = 0;
+	int local_minute = 0;
+	int local_second = 0;
+	int32_t france_offset_sec = 0;
+
+	if (gps_utc_to_france_local(date_year, date_month, date_day,
+				    utc_hour, utc_minute, utc_second,
+				    &local_year, &local_month, &local_day,
+				    &local_hour, &local_minute, &local_second,
+				    &france_offset_sec)) {
+		app_state.time_hour = (uint8_t)local_hour;
+		app_state.time_minute = (uint8_t)local_minute;
+		app_state.time_second = (uint8_t)local_second;
+		app_state.time_day = (uint8_t)local_day;
+		app_state.time_month = (uint8_t)local_month;
+		app_state.time_year = (uint16_t)local_year;
+		app_state.time_valid = true;
+		LOG_INF("GPS RMC UTC %04u-%02u-%02u %02u:%02u:%02u -> France local %04u-%02u-%02u %02u:%02u:%02u (UTC%+d)",
+			(unsigned int)date_year,
+			(unsigned int)date_month,
+			(unsigned int)date_day,
+			(unsigned int)utc_hour,
+			(unsigned int)utc_minute,
+			(unsigned int)utc_second,
+			(unsigned int)app_state.time_year,
+			(unsigned int)app_state.time_month,
+			(unsigned int)app_state.time_day,
+			(unsigned int)app_state.time_hour,
+			(unsigned int)app_state.time_minute,
+			(unsigned int)app_state.time_second,
+			(int)(france_offset_sec / 3600));
+	} else {
+		LOG_WRN("GPS RMC UTC to France local conversion failed, skip RTC sync fields");
+	}
+    } else {
+        LOG_WRN("GPS RMC date/time invalid, skip RTC sync fields");
     }
 
     *plat = lat;
     *plon = lon;
-    app_state.time_valid = true;
     return (lat != 0.0f || lon != 0.0f);
 }
 
@@ -341,12 +545,10 @@ static void process_nmea_stream(uint8_t *buf, size_t len)
                         app_state.gps_latitude = lat;
                         app_state.gps_longitude = lon;
                         app_state.gps_fix_count++;
-                        LOG_INF("GPS fix: lat=%.5f lon=%.5f (count=%u)",
-                                (double)lat, (double)lon, app_state.gps_fix_count);
-                        /* After a valid fix, power-save and schedule next poll in 1 hour */
-                        gps_power_off();
-                    }
-                }
+				LOG_INF("GPS fix: lat=%.5f lon=%.5f (count=%u)",
+					(double)lat, (double)lon, app_state.gps_fix_count);
+	                    }
+	                }
                 int fix_quality = 0;
                 int satellites = 0;
                 if (parse_gga_info(line_buf, &fix_quality, &satellites)) {
@@ -375,24 +577,32 @@ static bool gps_try_sync_system_time(void)
     }
 
     uint32_t epoch = 0U;
-    ret = task_rtc_get_epoch_utc(&epoch);
+    ret = task_rtc_get_epoch_local(&epoch);
     if (ret < 0) {
-        LOG_WRN("RTC epoch read after GPS sync failed: %d", ret);
+        LOG_WRN("RTC local epoch read after GPS sync failed: %d", ret);
         return false;
     }
 
     ret = retained_state_update_gps_sync(epoch);
     if (ret < 0) {
-        LOG_WRN("Retained GPS sync epoch update failed: %d", ret);
+        LOG_WRN("Retained GPS local epoch update failed: %d", ret);
         return false;
     }
 
-    LOG_INF("GPS sync epoch updated: %u", (unsigned int)epoch);
+    LOG_INF("GPS sync local epoch updated: %u", (unsigned int)epoch);
     return true;
 }
 
 bool task_gps_acquire_for_uplink(void)
 {
+	gps_last_rtc_sync_ok = false;
+
+	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED) {
+		initialized = false;
+		gps_log_microphone_debug_skip("acquire");
+		return false;
+	}
+
 	uint32_t now = k_uptime_get_32();
 	uint32_t old_fix_count = app_state.gps_fix_count;
 
@@ -455,9 +665,17 @@ bool task_gps_acquire_for_uplink(void)
 	if (app_state.gps_fix_count > old_fix_count) {
 		init_fail_count = 0U;
 		retry_deadline_ms = 0U;
-        (void)task_storage_persist_gps_coords(app_state.gps_latitude,
-                              app_state.gps_longitude);
-        (void)gps_try_sync_system_time();
+		gps_last_rtc_sync_ok = gps_try_sync_system_time();
+		if (!gps_last_rtc_sync_ok) {
+			LOG_WRN("GPS fix acquired but RTC/retained sync failed");
+		}
+		if (app_state.time_valid) {
+			(void)task_storage_persist_gps_coords(app_state.gps_latitude,
+							      app_state.gps_longitude);
+		} else {
+			LOG_WRN("GPS fix acquired without valid time, skip gps.txt append");
+		}
+		gps_power_off();
 		return true;
 	}
 
@@ -476,38 +694,67 @@ void task_gps_prepare_sleep(void)
 	gps_power_off();
 }
 
+static bool gps_acquire_with_timeout(uint32_t timeout_ms, bool *rtc_synced,
+				     bool mark_main_alive)
+{
+	if (rtc_synced != NULL) {
+		*rtc_synced = false;
+	}
+
+	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED) {
+		initialized = false;
+		gps_log_microphone_debug_skip("timed acquire");
+		return false;
+	}
+
+	if (timeout_ms == 0U) {
+		return false;
+	}
+
+	task_ina3221_block_active(true);
+
+	uint32_t start_ms = k_uptime_get_32();
+	bool got_fix = false;
+
+	while ((k_uptime_get_32() - start_ms) < timeout_ms) {
+		if (mark_main_alive) {
+			task_watchdog_mark_main_alive();
+		}
+		task_watchdog_feed();
+
+		if (task_gps_acquire_for_uplink()) {
+			got_fix = true;
+			if (rtc_synced != NULL) {
+				*rtc_synced = gps_last_rtc_sync_ok;
+			}
+			break;
+		}
+
+		if (mark_main_alive) {
+			task_watchdog_mark_main_alive();
+		}
+		k_msleep(1000);
+	}
+
+	task_gps_prepare_sleep();
+	if (mark_main_alive) {
+		task_watchdog_mark_main_alive();
+	}
+
+	if (!got_fix) {
+		LOG_WRN("GPS timed acquisition timeout (%u ms)", (unsigned int)timeout_ms);
+	}
+
+	task_ina3221_block_active(false);
+	return got_fix;
+}
+
 bool task_gps_acquire_with_timeout(uint32_t timeout_ms, bool *rtc_synced)
 {
-    if (rtc_synced != NULL) {
-        *rtc_synced = false;
-    }
+	return gps_acquire_with_timeout(timeout_ms, rtc_synced, false);
+}
 
-    if (timeout_ms == 0U) {
-        return false;
-    }
-
-    uint32_t start_ms = k_uptime_get_32();
-    bool got_fix = false;
-
-    while ((k_uptime_get_32() - start_ms) < timeout_ms) {
-        task_watchdog_feed();
-
-        if (task_gps_acquire_for_uplink()) {
-            got_fix = true;
-            if (gps_try_sync_system_time() && (rtc_synced != NULL)) {
-                *rtc_synced = true;
-            }
-            break;
-        }
-
-        k_msleep(1000);
-    }
-
-    task_gps_prepare_sleep();
-
-    if (!got_fix) {
-        LOG_WRN("GPS timed acquisition timeout (%u ms)", (unsigned int)timeout_ms);
-    }
-
-    return got_fix;
+bool task_gps_acquire_with_timeout_main_alive(uint32_t timeout_ms, bool *rtc_synced)
+{
+	return gps_acquire_with_timeout(timeout_ms, rtc_synced, true);
 }

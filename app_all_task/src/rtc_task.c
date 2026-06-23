@@ -5,7 +5,7 @@
  *   task_rtc_init()          - verify device is ready
  *   task_rtc_set_time()      - write an rtc_time struct
  *   task_rtc_get_time()      - read current time and log it
- *   task_rtc_set_from_gps()  - sync RTC from app_state GPS time fields
+ *   task_rtc_set_from_gps()  - sync RTC from app_state France-local GPS time fields
  */
 
 #include <zephyr/kernel.h>
@@ -45,6 +45,8 @@ LOG_MODULE_REGISTER(rtc_task, LOG_LEVEL_INF);
 
 /* Bind RTC device using the same alias as the official Zephyr RTC sample */
 static const struct device *const rtc_dev = DEVICE_DT_GET(DT_ALIAS(rtc));
+static int64_t rtc_default_seed_uptime_ms = -1;
+static bool rtc_storage_default_fallback_logged;
 
 #if defined(CONFIG_RTC_ALARM)
 static void rtc_alarm_cb(const struct device *dev, uint16_t id, void *user_data)
@@ -70,7 +72,7 @@ static bool rtc_is_leap_year(int year)
 	return (year % 4) == 0;
 }
 
-static bool rtc_datetime_to_epoch_utc(const struct rtc_time *tm, uint32_t *epoch)
+static bool rtc_datetime_to_epoch_local(const struct rtc_time *tm, uint32_t *epoch)
 {
 	if ((tm == NULL) || (epoch == NULL)) {
 		return false;
@@ -128,7 +130,7 @@ static bool rtc_datetime_to_epoch_utc(const struct rtc_time *tm, uint32_t *epoch
 	return true;
 }
 
-static bool rtc_epoch_to_datetime_utc(uint32_t epoch, struct rtc_time *tm)
+static bool rtc_epoch_to_datetime_local(uint32_t epoch, struct rtc_time *tm)
 {
 	if (tm == NULL) {
 		return false;
@@ -189,7 +191,7 @@ static bool rtc_compute_wday(struct rtc_time *tm)
 	}
 
 	uint32_t epoch = 0U;
-	if (!rtc_datetime_to_epoch_utc(tm, &epoch)) {
+	if (!rtc_datetime_to_epoch_local(tm, &epoch)) {
 		return false;
 	}
 
@@ -239,7 +241,7 @@ static bool rtc_is_default_or_uninitialized(const struct rtc_time *tm)
 	}
 
 	uint32_t epoch = 0U;
-	return !rtc_datetime_to_epoch_utc(tm, &epoch);
+	return !rtc_datetime_to_epoch_local(tm, &epoch);
 }
 
 static int rtc_ensure_default_time_if_needed(bool *used_default)
@@ -274,6 +276,7 @@ static int rtc_ensure_default_time_if_needed(bool *used_default)
 	}
 
 	rtc_default_seed_mark(true);
+	rtc_default_seed_uptime_ms = k_uptime_get();
 
 	if (used_default != NULL) {
 		*used_default = true;
@@ -362,7 +365,7 @@ int task_rtc_set_time(const struct rtc_time *tm)
 
 	rtc_default_seed_mark(false);
 
-    LOG_INF("RTC date and time set to: %04d-%02d-%02d %02d:%02d:%02d",
+    LOG_INF("RTC France local date and time set to: %04d-%02d-%02d %02d:%02d:%02d",
         write_tm.tm_year + 1900, write_tm.tm_mon + 1, write_tm.tm_mday,
         write_tm.tm_hour, write_tm.tm_min, write_tm.tm_sec);
 	return ret;
@@ -388,15 +391,113 @@ int task_rtc_get_time(struct rtc_time *tm)
 		return ret;
 	}
 
-	LOG_INF("RTC date and time: %04d-%02d-%02d %02d:%02d:%02d",
+	LOG_INF("RTC France local date and time: %04d-%02d-%02d %02d:%02d:%02d",
 		tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
 		tm->tm_hour, tm->tm_min, tm->tm_sec);
 	return 0;
 }
 
-int task_rtc_get_epoch_utc(uint32_t *epoch)
+static int rtc_fill_default_storage_time(struct rtc_time *tm)
 {
-	if (epoch == NULL) {
+	if (tm == NULL) {
+		return -EINVAL;
+	}
+
+	rtc_fill_default_time(tm);
+
+	uint32_t default_epoch = 0U;
+	if (!rtc_datetime_to_epoch_local(tm, &default_epoch)) {
+		return -EINVAL;
+	}
+
+	int64_t base_ms = rtc_default_seed_uptime_ms;
+	int64_t now_ms = k_uptime_get();
+	if ((base_ms < 0) || (now_ms < base_ms)) {
+		base_ms = 0;
+	}
+
+	uint64_t storage_epoch = (uint64_t)default_epoch +
+		(uint64_t)((now_ms - base_ms) / 1000);
+	if (storage_epoch > UINT32_MAX) {
+		return -EINVAL;
+	}
+
+	if (!rtc_epoch_to_datetime_local((uint32_t)storage_epoch, tm)) {
+		return -EINVAL;
+	}
+
+	if (!rtc_compute_wday(tm)) {
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+int task_rtc_get_time_for_storage(struct rtc_time *tm, bool *is_default_seed)
+{
+	if (tm == NULL) {
+		return -EINVAL;
+	}
+
+	if (is_default_seed != NULL) {
+		*is_default_seed = false;
+	}
+
+	if (!device_is_ready(rtc_dev)) {
+		return -ENODEV;
+	}
+
+	(void)memset(tm, 0, sizeof(*tm));
+	int ret = rtc_get_time(rtc_dev, tm);
+	if (ret < 0) {
+		if ((ret == -ENODATA) && rtc_default_seed_is_marked()) {
+			ret = rtc_fill_default_storage_time(tm);
+			if (ret < 0) {
+				return ret;
+			}
+			if (is_default_seed != NULL) {
+				*is_default_seed = true;
+			}
+			if (!rtc_storage_default_fallback_logged) {
+				LOG_WRN("RTC readback unavailable, synthesizing storage time from boot-seeded default RTC");
+				rtc_storage_default_fallback_logged = true;
+			}
+			return 0;
+		}
+
+		return ret;
+	}
+
+	uint32_t epoch = 0U;
+	if (!rtc_datetime_to_epoch_local(tm, &epoch)) {
+		if (rtc_default_seed_is_marked()) {
+			ret = rtc_fill_default_storage_time(tm);
+			if (ret < 0) {
+				return ret;
+			}
+			if (is_default_seed != NULL) {
+				*is_default_seed = true;
+			}
+			if (!rtc_storage_default_fallback_logged) {
+				LOG_WRN("RTC readback invalid, synthesizing storage time from boot-seeded default RTC");
+				rtc_storage_default_fallback_logged = true;
+			}
+			return 0;
+		}
+
+		return -EINVAL;
+	}
+
+	if (is_default_seed != NULL) {
+		*is_default_seed = rtc_default_seed_is_marked();
+	}
+
+	return 0;
+}
+
+int task_rtc_get_epoch_local(uint32_t *local_epoch)
+{
+	if (local_epoch == NULL) {
 		return -EINVAL;
 	}
 
@@ -414,8 +515,8 @@ int task_rtc_get_epoch_utc(uint32_t *epoch)
 		return -EINVAL;
 	}
 
-	if (!rtc_datetime_to_epoch_utc(&tm, epoch)) {
-		LOG_WRN("RTC date/time invalid for epoch conversion");
+	if (!rtc_datetime_to_epoch_local(&tm, local_epoch)) {
+		LOG_WRN("RTC date/time invalid for local epoch conversion");
 		return -EINVAL;
 	}
 
@@ -477,7 +578,7 @@ int task_rtc_set_alarm_in_seconds(uint32_t seconds_from_now)
 	}
 
 	uint32_t now_epoch = 0U;
-	if (!rtc_datetime_to_epoch_utc(&now_tm, &now_epoch)) {
+	if (!rtc_datetime_to_epoch_local(&now_tm, &now_epoch)) {
 		LOG_WRN("RTC date/time invalid for alarm setup");
 		return -EINVAL;
 	}
@@ -485,7 +586,7 @@ int task_rtc_set_alarm_in_seconds(uint32_t seconds_from_now)
 	uint32_t target_epoch = now_epoch + seconds_from_now;
 	struct rtc_time alarm_tm;
 	memset(&alarm_tm, 0, sizeof(alarm_tm));
-	if (!rtc_epoch_to_datetime_utc(target_epoch, &alarm_tm)) {
+	if (!rtc_epoch_to_datetime_local(target_epoch, &alarm_tm)) {
 		return -EINVAL;
 	}
 	alarm_tm.tm_wday = (now_tm.tm_wday >= 0 && now_tm.tm_wday <= 6) ?
@@ -521,7 +622,7 @@ int task_rtc_set_alarm_in_seconds(uint32_t seconds_from_now)
 
 /* --------------------------------------------------------------------------
  * task_rtc_set_from_gps
- * Reads app_state GPS time fields and programs the RTC, then reads back to
+ * Reads app_state France-local GPS time fields and programs the RTC, then reads back to
  * confirm - mirrors the set_date_time / get_date_time pattern of the sample.
  * -------------------------------------------------------------------------- */
 int task_rtc_set_from_gps(void)

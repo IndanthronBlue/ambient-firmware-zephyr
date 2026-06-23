@@ -3,13 +3,12 @@
 #include <zephyr/sys/atomic.h>
 
 #include "tasks.h"
+#include "app_feature_flags.h"
 
 LOG_MODULE_REGISTER(comm_task, LOG_LEVEL_INF);
 
-#define GPS_UPLINK_WAIT_TIMEOUT_MS 20000U
-
 static struct k_thread comm_thread_data;
-K_THREAD_STACK_DEFINE(comm_thread_stack, 1536);
+K_THREAD_STACK_DEFINE(comm_thread_stack, 4096);
 static K_SEM_DEFINE(comm_sem, 0, 1);
 static atomic_t comm_pending_flags;
 static atomic_t comm_busy;
@@ -34,34 +33,52 @@ static void comm_worker_thread(void *a, void *b, void *c)
 		}
 
 		atomic_set(&comm_busy, 1);
+		task_watchdog_set_comm_active(true);
+		task_watchdog_mark_comm_alive();
 		power_fsm_request_wakeup(POWER_WAKE_SRC_COMM);
+
+		if (task_lorawan_drop_uplink_if_backoff()) {
+			task_status_led_event(STATUS_LED_ERROR);
+			goto done;
+		}
 
 		bool require_gps = (pending & COMM_PENDING_NEED_GPS) != 0U;
 		bool wait_gps = (pending & COMM_PENDING_WAIT_GPS) != 0U;
-		if (require_gps) {
+		if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED && (require_gps || wait_gps)) {
+			LOG_INF("Comm worker: microphone debug mode, skip GPS stage");
+		} else if (require_gps) {
 			LOG_INF("Comm worker: start GPS->LoRa event (typed=NEED_GPS)");
+			task_ina3221_block_active(true);
 			(void)task_gps_acquire_for_uplink();
+			task_ina3221_block_active(false);
+			task_watchdog_mark_comm_alive();
 		} else if (wait_gps) {
 			bool rtc_synced = false;
 			LOG_INF("Comm worker: start timed GPS->LoRa event (typed=WAIT_GPS, timeout=%u ms)",
-				(unsigned int)GPS_UPLINK_WAIT_TIMEOUT_MS);
-			if (!task_gps_acquire_with_timeout(GPS_UPLINK_WAIT_TIMEOUT_MS, &rtc_synced)) {
+				(unsigned int)APP_GPS_UPLINK_WAIT_TIMEOUT_MS);
+			task_status_led_event(STATUS_LED_GPS_WAIT);
+			if (!task_gps_acquire_with_timeout(APP_GPS_UPLINK_WAIT_TIMEOUT_MS, &rtc_synced)) {
 				LOG_WRN("Comm worker: timed GPS unavailable, fallback to LoRa only");
 			} else if (!rtc_synced) {
 				LOG_WRN("Comm worker: GPS fix acquired but RTC sync not confirmed");
 			}
+			task_watchdog_mark_comm_alive();
 		} else {
 			LOG_INF("Comm worker: start LoRa event (typed=NO_GPS)");
 		}
 
+		task_watchdog_mark_comm_alive();
 		int lora_ret = task_lorawan_send_event_uplink();
+		task_watchdog_mark_comm_alive();
 		if (lora_ret == 0) {
 			LOG_INF("Comm worker: event done");
 		} else {
 			LOG_WRN("Comm worker: LoRa send failed (err=%d), uplink cache will be overwritten on next window", lora_ret);
 		}
 
+done:
 		atomic_set(&comm_busy, 0);
+		task_watchdog_set_comm_active(false);
 	}
 }
 
@@ -100,6 +117,12 @@ void task_comm_request_uplink_typed(task_comm_uplink_type_t type)
 {
 	uint32_t flag;
 
+	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED && (type != TASK_COMM_UPLINK_NO_GPS)) {
+		LOG_INF("Comm request coerced to NO_GPS by microphone debug mode");
+		type = TASK_COMM_UPLINK_NO_GPS;
+	}
+
+	// DEBUG
 	switch (type) {
 	case TASK_COMM_UPLINK_NEED_GPS:
 		flag = COMM_PENDING_NEED_GPS;
@@ -112,6 +135,8 @@ void task_comm_request_uplink_typed(task_comm_uplink_type_t type)
 		flag = COMM_PENDING_NO_GPS;
 		break;
 	}
+
+	// flag = COMM_PENDING_NO_GPS;
 
 	atomic_or(&comm_pending_flags, (atomic_val_t)flag);
 	power_fsm_request_wakeup(POWER_WAKE_SRC_COMM);
