@@ -29,6 +29,69 @@ config APP_DEEP_SLEEP_SIMULATE
 	  Keep low-power flow testable on platforms where true standby is
 	  unavailable during bring-up.
 
+config APP_MICROPHONE_DEBUG_SKIP_GPS_LORA
+	bool "Microphone debug: skip real GPS and LoRa operations"
+	default n
+	help
+	  Enable this while debugging the microphone/codec path. GPS acquisition,
+	  GPS power toggling, LoRaWAN join, and LoRaWAN uplink calls are skipped so
+	  microphone tests are not blocked by radio/GNSS hardware behavior.
+
+config APP_STATUS_LED
+	bool "Enable low-power managed status LED"
+	default y
+	help
+	  Enable short, event-driven LED pulses. The LED is forced off before
+	  suspend/deep sleep and must not be used directly by feature tasks.
+
+config APP_INFERENCE_LABEL_CNT
+	int "Inference classifier label count"
+	default 11
+	range 1 254
+	help
+	  Number of classifier vocabulary labels. LoRa uplinks report this many
+	  label count buckets plus one extra bucket for bird detections whose
+	  confidence is below the threshold.
+
+config APP_INFERENCE_LABELS_FILE
+	string "Inference classifier label list file"
+	default "config/inference_labels.txt"
+	help
+	  Text file containing one human-readable classifier label per line.
+	  Relative paths are resolved from the application source directory.
+
+config APP_INFERENCE_USE_INT16_QUANT_MODEL
+	bool "Use int16 quantized inference model interface"
+	default n
+	help
+	  Use int16_t fixed-point tensors for the generated Qualia model headers.
+	  The application still computes MFCC features in float, then quantizes
+	  them before model execution and dequantizes output logits for scoring.
+
+config APP_LORAWAN_UPLINK_INTERVAL_MS
+	int "LoRaWAN uplink interval"
+	default 1800000
+	range 1000 86400000
+	help
+	  Time window for one LoRaWAN telemetry packet. The default is 30 minutes.
+
+config APP_INFERENCE_DETECT_CONF_THRESH_PERCENT
+	int "Bird detector confidence threshold percent"
+	default 50
+	range 0 100
+	help
+	  Minimum small-model bird probability required before running the
+	  classifier. Bird-positive detections below this threshold are counted in
+	  the extra low-confidence bird uplink bucket.
+
+config APP_GPS_UPLINK_WAIT_TIMEOUT_MS
+	int "GPS wait timeout before LoRa uplink"
+	default 30000
+	range 0 300000
+	help
+	  Maximum time to wait for a GPS fix before sending the pending LoRa uplink
+	  without fresh GPS data.
+
 menu "Wakeup source switches"
 
 config APP_WAKEUP_SRC_BUTTON
@@ -68,12 +131,12 @@ config APP_WAKEUP_SRC_LOW_BAT
 	  Allow low-battery event to force transition into deep sleep.
 
 config APP_GPS_LOCAL_TIME_OFFSET_HOURS
-	int "GPS local time offset from UTC (hours)"
+	int
 	default 2
 	range -12 14
 	help
-	  Local time offset applied to GPS UTC time before programming RTC.
-	  France typically uses 1 in winter and 2 in summer (DST).
+	  Deprecated compatibility option. RTC and retained GPS sync epochs stay
+	  in UTC; audio storage paths also use UTC.
 
 endmenu
 
