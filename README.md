@@ -1,408 +1,498 @@
-# AMBIENT Zephyr Firmware Guide
+# AMBIENT Bird Firmware
 
-This README covers the project overview, repository structure, build/flash flow, DFU, execution flow, module responsibilities, configurable parameters, and Devicetree configuration.
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE.txt)
+![Zephyr](https://img.shields.io/badge/Zephyr-4.3.99-7c3aed.svg)
+![MCUs](https://img.shields.io/badge/MCU-STM32L496%20%7C%20STM32U595R-03234b.svg)
+![LoRaWAN](https://img.shields.io/badge/LoRaWAN-OTAA%20EU868-00a3a3.svg)
+![DFU](https://img.shields.io/badge/DFU-MCUboot%20signed-orange.svg)
 
-Current Zephyr version used by this project: `4.3.99`.
+Firmware for the AMBIENT bird-monitoring node based on the
+[LEAT-EDGE/ambient](https://github.com/LEAT-EDGE/ambient) open hardware.
+This Zephyr firmware has been tested on STM32L496 and STM32U595R MCUs:
+STM32L496 uses the Zephyr board `stm32l496g_bird` and Devicetree file
+[stm32l496g_bird/stm32l496g_bird.dts](stm32l496g_bird/stm32l496g_bird.dts);
+STM32U595R uses the Zephyr board `stm32u5_bird` and Devicetree file
+[stm32u5_bird/stm32u5_bird.dts](stm32u5_bird/stm32u5_bird.dts). The firmware
+wakes periodically, records audio, stores audio files, runs bird recognition,
+sends a LoRaWAN summary, and then returns to a low-power state.
 
----
+| Item | Value |
+| --- | --- |
+| Hardware | [LEAT-EDGE/ambient](https://github.com/LEAT-EDGE/ambient) |
+| Zephyr version | `4.3.99` |
+| Tested MCUs | STM32L496, STM32U595R |
+| Zephyr boards | `stm32l496g_bird`, `stm32u5_bird` |
+| Application | [app_all_task](app_all_task) |
+| Update method | MCUboot signed image, PC flashing, SD-card DFU |
+| LoRaWAN mode | OTAA, EU868 by default |
 
-## 1. Purpose and Feature Overview
+This firmware requires MCUboot signature verification. The initial PC flashing
+flow and later SD-card DFU updates must both use an application image signed
+with the private key that matches the public key compiled into MCUboot.
 
-`AMBIENT` is a low-power edge sensing firmware based on Zephyr, running on `stm32u5_bird` (with retained compatibility for the `stm32l496g_bird` overlay), providing:
+## Zephyr Version
 
-- Audio capture (SAI/I2S + ADC3101)
-- MFCC + bird detection/classification inference (CMSIS-DSP + two-stage models)
-- GPS acquisition and RTC synchronization
-- LoRaWAN OTAA join and event uplink
-- SD-card storage and offline DFU (MCUboot)
-- Power state machine (ACTIVE / SUSPEND / DEEP_SLEEP)
-- Low-battery protection, watchdog, and retained-state persistence
-
-Core goal: continuously run the “capture → infer → communicate → store → sleep” loop under low-power duty-cycling.
-
----
-
-## 2. Repository Structure
-
-### 2.1 Application Directory
-
-- `app_all_task/`
-  - `CMakeLists.txt`: application source entry
-  - `Kconfig`: app-level switches (low power, wake sources, GPS local-time offset)
-  - `prj.conf`: Zephyr configuration (drivers, middleware, LoRaWAN, MCUboot, etc.)
-  - `boards/`
-    - `stm32u5_bird.overlay`: main board overlay (currently used for build)
-    - `stm32l496g_bird.overlay`: compatibility overlay
-  - `dts/bindings/sensor/kionix,kxtj3-1057.yaml`: KXTJ3 binding
-  - `src/`
-    - `main.c`: boot flow and main loop
-    - `power_fsm.c` / `power_ctrl.c`: low-power state machine and power-domain control
-    - `microphone_task.c` / `ADC3101.c`: audio capture and codec setup
-    - `inference_task.c`: MFCC + model inference
-    - `comm_task.c` / `lorawan_task.c` / `gps_task.c`: communication pipeline
-    - `storage_task.c` / `dfu_task.c`: SD storage and DFU
-    - `sensor_task.c` / `ina3221_task.c` / `rtc_task.c` / `system_task.c`
-
-### 2.2 Related Upper-Level Directories
-
-- `bootloader/mcuboot/`: MCUboot source (must be flashed first on initial deployment)
-- `zephyr/boards/st/stm32u5_bird/`: board base DTS (partitions and peripheral nodes)
-- `build/`: current build outputs (for example, `build_info.yml`)
-
----
-
-## 3. Build and Flash
-
-All commands below assume the workspace root: `/home/jzhang/zephyrproject`
-
-### Environment Setup
-
-1. Install Zephyr dependencies and make sure `west` is available
-2. Install STM32CubeProgrammer (required by `west flash`)
-3. Connect board power and ST-Link
-4. Activate the Python virtual environment
+The current project uses Zephyr `4.3.99`. You can check it in the workspace:
 
 ```bash
-source .venv/bin/activate
+cat /home/jzhang/zephyrproject/zephyr/VERSION
 ```
 
-### First-Time Deployment (Recommended, bootloader-first)
+## Purpose and Feature Overview
 
-### Step A: Full Chip Erase
+The goal of this firmware is low-power bird monitoring on AMBIENT hardware. The
+device sleeps most of the time, wakes on schedule, captures audio, runs local
+recognition, stores data, and sends a summary over LoRaWAN.
 
-Use STM32CubeProgrammer GUI, or CLI:
+Main features:
 
-```bash
-STM32CLI=/your/path/STM32CubeProgrammer/bin/STM32_Programmer_CLI
-$STM32CLI -c port=SWD mode=UR -e all
-```
+- ADC3101 + SAI/I2S audio capture at 16 kHz mono.
+- `.wav` audio storage on SD card.
+- MFCC plus two-stage bird detection/classification models.
+- BME280 and INA3221 environmental and power-state sampling.
+- GPS location acquisition and RTC/time synchronization.
+- LoRaWAN OTAA join and event uplink.
+- MCUboot signed boot and offline SD-card DFU.
+- ACTIVE / SUSPEND / DEEP_SLEEP low-power state machine.
+- Low-battery protection, watchdog, and retained state.
 
-### Step B: Build and Flash MCUboot First
+## Repository Structure
 
-Before building MCUboot, create the board overlay in the MCUboot project so that bootloader code is linked to `boot_partition`:
+| Path | Description |
+| --- | --- |
+| [app_all_task](app_all_task) | Main application, including CMake, Kconfig, prj.conf, board overlays, and task sources. |
+| [app_all_task/src](app_all_task/src) | Firmware task code for audio, inference, LoRaWAN, GPS, storage, DFU, low power, and related features. |
+| [app_all_task/config](app_all_task/config) | Application data files, currently including the inference label list. |
+| [app_all_task/boards](app_all_task/boards) | Application overlays and board-specific configuration files. |
+| [app_all_task/dts/bindings](app_all_task/dts/bindings) | Custom Devicetree bindings used by this application. |
+| [stm32l496g_bird](stm32l496g_bird) | STM32L496 board definition and base Devicetree. |
+| [stm32u5_bird](stm32u5_bird) | STM32U595R board definition and base Devicetree. |
 
-File: `bootloader/mcuboot/boot/zephyr/boards/stm32u5_bird.overlay`
+## How It Runs
 
-```dts
-/ {
-  chosen {
-    zephyr,console = &usart2;
-    zephyr,shell-uart = &usart2;
-    zephyr,code-partition = &boot_partition;
-  };
-};
-```
+After power-on, the device automatically:
 
-> Note: `boot_partition`, `slot0_partition`, and `slot1_partition` are already defined in the board DTS `zephyr/boards/st/stm32u5_bird/stm32u5_bird.dts`. This overlay only selects `boot_partition` for MCUboot linking.
+1. Initializes RTC, SD card, microphone, sensors, LoRaWAN, watchdog, and the low-power state machine.
+2. Periodically enters an ACTIVE window to capture audio and run bird detection/classification.
+3. Stores audio to the SD card as `.wav`.
+4. Sends one summary payload over LoRaWAN when the uplink interval is reached.
+5. Enters low power or deep sleep when needed, and wakes through RTC or configured wake sources.
 
-```bash
-west build -p always -b stm32u5_bird bootloader/mcuboot/boot/zephyr
-west flash
-```
-
-> If your target board is `stm32l496g_bird`, replace `-b` with the corresponding board name.
-
-### Step C: Build and Flash Application
-
-```bash
-west build -p always -b stm32u5_bird app_all_task
-west flash
-```
-
-> In `prj.conf`, this project enables `CONFIG_BOOTLOADER_MCUBOOT=y` and `CONFIG_USE_DT_CODE_PARTITION=y`, and the application links to DTS `slot0_partition`.
-
-### Serial Log Monitoring
-
-`stm32u5_bird.overlay` routes console to `USART2` at 115200 baud:
+Typical serial log monitoring:
 
 ```bash
 minicom -D /dev/ttyACM0 -b 115200
 ```
 
----
-
-## 3.1 DFU Firmware Update (Offline via SD Card)
-
-Offline SD-card DFU is implemented in `src/dfu_task.c`.
-
-### Trigger Flow
-
-1. Build a new application image (MCUboot-compatible)
-2. Put the generated image in SD root as `update.bin`
-3. On boot/reboot, `task_dfu_check_and_apply()` runs during startup
-
-### In-App DFU Logic (Automatic)
-
-- Check if `/SD:/update.bin` exists and has valid size
-- Erase `slot1_partition`
-- Write image to slot1 in chunks (4KB)
-- Call `boot_request_upgrade(BOOT_UPGRADE_PERMANENT)`
-- Rename `update.bin` to `update.done` (or delete if rename fails)
-- Cold reboot; MCUboot switches to new image
-
-### Notes
-
-- For first deployment, MCUboot must already be flashed
-- Update image size must not exceed `slot1_partition`
-- Current code requests **PERMANENT** upgrade (not test/revert mode)
-
----
-
-## 4. Detailed Execution Flow
-
-## 4.1 Boot Stage (`main.c`)
-
-1. Lock PM boot guard and read reset cause
-2. Print firmware version, feature flags, and MCUboot self-check info
-3. Execute `boot_write_img_confirmed()` to confirm current image
-4. Initialize RTC, communication thread, and optional button/sound wakeup
-5. Power-cycle `v_periph` (cold start), then initialize microphone
-6. Mount SD and run DFU check/apply
-7. Sensor sample, startup LoRaWAN connect attempt, INA3221 worker, watchdog
-8. Initialize retained state and check battery voltage once (may re-enter deep sleep if low)
-9. Block until GPS legal time sync is ready (continue after timeout)
-10. Initialize `power_fsm`, then enter main loop: `tick -> wait_for_event`
-
-## 4.2 Power State Machine (`power_fsm.c`)
-
-- `INITIAL`: transition state
-- `SUSPEND`: low-power waiting (periodic or external wake)
-- `ACTIVE`: run capture/inference/uplink window
-- `DEEP_SLEEP`: deep sleep for low-battery and related cases (configurable simulation)
-
-Key transitions:
-
-- Periodic timeout: `SUSPEND -> ACTIVE`
-- button/sound/comm event: `SUSPEND -> ACTIVE`
-- low-battery event: any state priority transition `-> DEEP_SLEEP`
-- ACTIVE window complete: `ACTIVE -> SUSPEND`
-
-## 4.3 ACTIVE Window Pipeline
-
-1. `task_microphone_capture_once()` triggers one audio capture
-2. Audio blocks feed inference pipeline (`task_inference_process_block`)
-3. Every 6 windows completes one inference label update
-4. When 10 labels are accumulated (`infer_window_ready=true`):
-   - Sample environmental sensors
-   - Snapshot uplink window
-   - Submit comm worker
-5. comm worker executes by type:
-   - Optional GPS acquire / timeout wait
-   - `task_lorawan_send_event_uplink()` sends 29-byte payload
-6. On success, clear state and continue state-machine cycle
-
----
-
-## 5. Module Responsibilities
-
-- `main.c`
-  - Boot orchestration, boot self-check, init ordering, main loop
-
-- `power_fsm.c`
-  - Low-power state scheduling, unified wake-source and periodic strategy
-
-- `power_ctrl.c`
-  - `v_periph`/GPS power-domain control, GPIO parking, peripheral sleep/default pinctrl switching
-
-- `microphone_task.c`
-  - SAI1_B 16kHz capture, ring buffer, dual consumer pipeline for inference and SD
-
-- `ADC3101.c`
-  - ADC3101 codec register initialization (analog front-end gains, etc.)
-
-- `inference_task.c`
-  - MFCC extraction + detector/classifier two-stage inference
-  - 10-label window management and uplink snapshot
-
-- `gps_task.c`
-  - I2C NMEA reading, RMC/GGA parsing, coordinate update, RTC sync
-
-- `lorawan_task.c`
-  - LoRaWAN OTAA join, retry/backoff, uplink payload build and send
-
-- `comm_task.c`
-  - Dedicated worker chaining `GPS -> LoRa` to decouple from main state machine
-
-- `storage_task.c`
-  - SD mount retries, capacity query, PCM writes, DevEUI/GPS persistence
-
-- `dfu_task.c`
-  - Offline SD update to slot1 + MCUboot upgrade request
-
-- `sensor_task.c`
-  - BME280 temperature/pressure/humidity sampling
-
-- `ina3221_task.c`
-  - INA3221 periodic voltage/current monitoring and low-battery event reporting
-
-- `rtc_task.c`
-  - RTC init, default-time seed, GPS time sync, alarm wakeup
-
-- `system_task.c`
-  - Watchdog initialization and feeder thread
-
-- `button_task.c` / `sound_wakeup_task.c`
-  - External interrupt wake sources
-
-- `retained_state.c`
-  - Retention-region persistent state (boot count, GPS sync epoch, recovery counters, etc.)
-
----
-
-## 6. Configurable Parameters (Purpose / Default / Recommended / Location)
-
-> Notes:
-> - “Default” means current value in this repository state.
-> - “Recommended” targets current hardware and typical field deployment; tune as needed for power-latency tradeoff.
-
-## 6.1 Kconfig (Application-Level Switches)
-
-| Parameter | Purpose | Default | Recommended | Location |
-|---|---|---:|---:|---|
-| `CONFIG_APP_LOW_POWER_FSM` | Enable low-power FSM | `y` | `y` | `prj.conf`, `Kconfig` |
-| `CONFIG_APP_DEEP_SLEEP_ENABLE` | Allow real deep sleep | `y` | `y` (production) / `n` (debug) | `prj.conf`, `Kconfig` |
-| `CONFIG_APP_RETENTION_ENABLE` | Enable retention persistence | `y` | `y` | `prj.conf`, `Kconfig` |
-| `CONFIG_APP_DEEP_SLEEP_SIMULATE` | Simulate deep sleep (no real power-off) | `n` | `n` (production) / `y` (bring-up) | `prj.conf`, `Kconfig` |
-| `CONFIG_APP_WAKEUP_SRC_BUTTON` | Button wake source | `y` | `y` | `prj.conf`, `Kconfig` |
-| `CONFIG_APP_WAKEUP_SRC_PERIODIC` | Periodic wake source | `y` | `y` | `prj.conf`, `Kconfig` |
-| `CONFIG_APP_WAKEUP_SRC_COMM` | Communication wake source | `y` | `y` | `prj.conf`, `Kconfig` |
-| `CONFIG_APP_WAKEUP_SRC_RTC_ALARM` | RTC alarm wake source | `y` | `y` | `prj.conf`, `Kconfig` |
-| `CONFIG_APP_WAKEUP_SRC_SOUND` | Sound IRQ wake source | `n` | `n/y` depending on false-trigger profile | `prj.conf`, `Kconfig` |
-| `CONFIG_APP_WAKEUP_SRC_LOW_BAT` | Low-battery deep-sleep trigger | `y` | `y` | `prj.conf`, `Kconfig` |
-| `CONFIG_APP_GPS_LOCAL_TIME_OFFSET_HOURS` | GPS UTC to local-time offset | `2` | set by deployment timezone (France: winter 1, summer 2) | `prj.conf`, `Kconfig` |
-
-## 6.2 Zephyr Stack and Middleware Parameters (`prj.conf`)
-
-| Parameter | Purpose | Default | Recommended | Location |
-|---|---|---:|---:|---|
-| `CONFIG_LORAWAN_REGION_EU868` | LoRaWAN region | `y` | match your gateway/network | `prj.conf` |
-| `CONFIG_LORAWAN` / `CONFIG_LORA` | LoRaWAN stack and LoRa PHY | `y/y` | `y/y` | `prj.conf` |
-| `CONFIG_BOOTLOADER_MCUBOOT` | Enable MCUboot integration | `y` | `y` | `prj.conf` |
-| `CONFIG_USE_DT_CODE_PARTITION` | Use DTS `slot0_partition` for code | `y` | `y` | `prj.conf` |
-| `CONFIG_MCUBOOT_GENERATE_UNSIGNED_IMAGE` | Generate unsigned image | `y` | production should use signed-image flow | `prj.conf` |
-| `CONFIG_MAIN_STACK_SIZE` | Main thread stack | `8192` | `8192` (increase if features grow) | `prj.conf` |
-| `CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE` | System workqueue stack | `2048` | `2048+` for heavier LoRa control path | `prj.conf` |
-| `CONFIG_LOG_DEFAULT_LEVEL` | Log level | `3(INFO)` | `4` debug, `2~3` production | `prj.conf` |
-| `CONFIG_LOG_BUFFER_SIZE` | Log buffer size | `16384` | `16384` or larger | `prj.conf` |
-
-## 6.3 Key Application Compile-Time Macros
-
-| Parameter | Purpose | Default | Recommended | Location |
-|---|---|---:|---:|---|
-| `APP_LOW_BATTERY_MV` | Low-battery threshold | `3500` mV | `3400~3600` mV | `src/tasks.h` |
-| `APP_BOOT_GPS_SYNC_TIMEOUT_MS` | Boot blocking GPS-sync timeout | `180000` ms | `60000~180000` | `src/main.c` |
-| `APP_BOOT_GPS_RETRY_DELAY_MS` | Boot GPS retry interval | `5000` ms | `3000~10000` | `src/main.c` |
-| `ACTIVE_BURST_MS` | ACTIVE window duration | `30000` ms | `20000~60000` | `src/power_fsm.c` |
-| `SUSPEND_TO_ACTIVE_PERIOD_MS` | SUSPEND periodic wake interval | `60000` ms | tune by power budget | `src/power_fsm.c` |
-| `DEEP_SLEEP_WAKE_PERIOD_MS` | Deep-sleep wake period | `30000` ms | production recommendation: >= `30min` | `src/power_fsm.c` |
-| `GPS_UPLINK_WAIT_TIMEOUT_MS` | GPS wait timeout in comm worker | `20000` ms | `10000~60000` | `src/comm_task.c` / `src/power_fsm.c` |
-| `LORAWAN_APP_PORT` | Uplink port | `2` | must match cloud decoder | `src/lorawan_task.c` |
-| `TX_PAYLOAD_LENGTH` | LoRa uplink payload length | `29` bytes | keep aligned with parser | `src/lorawan_task.c` |
-| `MIC_SAMPLE_FREQUENCY` | Audio sample rate | `16000` Hz | `16000` | `src/microphone_task.c` |
-| `MIC_BLOCK_COUNT` | I2S slab block count | `6` | `6~12` (RAM dependent) | `src/microphone_task.c` |
-| `MIC_RING_BLOCK_COUNT` | Capture ring block count | `30` | `30+` if throughput is tight | `src/microphone_task.c` |
-| `INA_MONITOR_PERIOD_MS` | INA monitor period | `30000` ms | `10000~60000` | `src/ina3221_task.c` |
-| `WATCHDOG_TIMEOUT_MS` | Watchdog timeout | `24000` ms | `> 2x feed period` | `src/system_task.c` |
-| `WATCHDOG_FEED_PERIOD_MS` | Watchdog feed period | `10000` ms | `5000~12000` | `src/system_task.c` |
-| `DFU_READ_CHUNK_SIZE` | DFU chunk size | `4096` bytes | `4096` | `src/dfu_task.c` |
-
-## 6.4 Credential Parameters (LoRaWAN OTAA)
-
-| Parameter | Purpose | Default | Recommended | Location |
-|---|---|---|---|---|
-| `join_eui` | OTAA JoinEUI | all `0x00` (placeholder) | replace with network-issued value | `src/lorawan_task.c` |
-| `dev_eui` | Device EUI | HWID-derived + SD persisted | keep deterministic generation + persistence | `src/lorawan_task.c` + `src/storage_task.c` |
-| `app_key` | OTAA AppKey/NwkKey | currently hardcoded | production should use secure provisioning (not in repo) | `src/lorawan_task.c` |
-
----
-
-## 7. Devicetree Configuration
-
-## 7.1 Current Effective Devicetree Sources (`stm32u5`)
-
-According to `build/build_info.yml`, current build uses:
-
-- Base DTS: `zephyr/boards/st/stm32u5_bird/stm32u5_bird.dts`
-- App Overlay: `app_all_task/boards/stm32u5_bird.overlay`
-
-## 7.2 Key `chosen` and Partition Setup
-
-In overlay:
-
-- `zephyr,console = &usart2`
-- `zephyr,shell-uart = &usart2`
-- `zephyr,code-partition = &slot0_partition`
-- `zephyr,retained-ram` / `zephyr,retained-mem` bound
-
-In base DTS (`stm32u5_bird.dts`):
-
-- `boot_partition`: `0x00000000` + `0x10000` (64KB)
-- `slot0_partition`: `0x00010000` + `0x0E8000` (928KB)
-- `slot1_partition`: `0x000F8000` + `0x0E8000` (928KB)
-- `scratch_partition`: 64KB
-- `storage_partition`: 64KB
-
-## 7.3 Key Peripheral Node Mapping
-
-- `&i2c1`
-  - `bme280@76`
-  - `cam_m8q@gps(0x10)`
-- `&i2c2`
-  - `ina3221@40`
-- `&spi3`
-  - `sx1262@0` (LoRa)
-  - `sdhc@1` (SPI SD card)
-- `&sai1_b`
-  - audio capture interface (enabled in overlay with sleep pinctrl)
-- `v_periph` fixed regulator control node
-- `gps_on_off` / `gps_vbckp` GPIO power control
-- `sw0`, `sound-wakeup-en`, `sound-wakeup-irq` wake-related aliases
-- `&rtc` with `wakeup-source`
-
-## 7.4 Extra Overlay Configuration
-
-`stm32u5_bird.overlay` additionally configures:
-
-- retained SRAM region (`retained_region` / `retained_mem` / `app_retention`)
-- `sai1_b` `default/sleep` pinctrl states
-- `i2c1/i2c2` 100kHz
-- INA3221 shunt resistor and enabled-channel overrides
-- SPI3 sleep-pin states and clock source refinements
-- PLL2 tuning
-
----
-
-## Appendix A: LoRaWAN Event Payload (29 Bytes)
-
-`lorawan_task.c` builds a fixed 29-byte payload:
-
-- `0..9`: 10 inference labels (uplink snapshot)
-- `10..13`: battery/solar voltage (mV)
-- `14`: temperature (int8 truncation)
-- `15..16`: inference total count (low 16 bits)
-- `17..20`: battery/solar current (mA)
-- `21`: SD write success flag
-- `22..25`: compressed latitude/longitude
-- `26..27`: average RMS (compressed)
-- `28`: SD usage percent
-
-![Example](https://blue-image-1306182246.cos.ap-shanghai.myqcloud.com/typora/Weixin%20Image_20260316110047_18_266.png)
-
-## Appendix B: Common Commands
+If the serial device is different, check it with:
 
 ```bash
-# 1) Build application
-west build -p always -b stm32u5_bird app_all_task
-
-# 2) Flash
-west flash
-
-# 3) Check current build metadata
-cat build/build_info.yml
+ls /dev/ttyACM* /dev/ttyUSB*
 ```
 
-If switching to `stm32l496g_bird`, verify in sync:
+## Configurable Parameters
 
-- `-b` board target
-- matching overlay
-- LoRa/GPS/SD/audio pinmux and power-control nodes
+Most configuration is in [app_all_task/prj.conf](app_all_task/prj.conf). The
+application Kconfig definitions are in [app_all_task/Kconfig](app_all_task/Kconfig).
+
+| Parameter | Purpose | Current value | Recommended value | Location |
+| --- | --- | --- | --- | --- |
+| `CONFIG_APP_LOW_POWER_FSM` | Enable the low-power state machine. | `y` | Keep `y` for production. | `prj.conf` |
+| `CONFIG_APP_DEEP_SLEEP_ENABLE` | Allow real deep-sleep / power-off paths. | `y` | `y` for production; temporarily disable only for power debugging. | `prj.conf` |
+| `CONFIG_APP_RETENTION_ENABLE` | Enable retained state. | `y` | Keep `y` for production. | `prj.conf` |
+| `CONFIG_APP_DEEP_SLEEP_SIMULATE` | Simulate deep sleep without actual power-off. | `n` | `n` for production; `y` for bring-up. | `prj.conf` |
+| `CONFIG_APP_MICROPHONE_DEBUG_SKIP_GPS_LORA` | Skip GPS and LoRaWAN while debugging the microphone path. | `n` | `n` for normal operation; `y` for audio debugging. | `prj.conf` |
+| `CONFIG_APP_STATUS_LED` | Enable status LED event pulses. | `n` | `n` for low-power deployment; `y` for field debugging. | `prj.conf` |
+| `CONFIG_APP_INFERENCE_LABEL_CNT` | Number of classifier labels. | `11` | Must match the number of non-empty lines in the label file. | `prj.conf`, `Kconfig` |
+| `CONFIG_APP_INFERENCE_LABELS_FILE` | Classifier label file. | `config/inference_labels.txt` | Update together with model labels. | `prj.conf`, `app_all_task/config` |
+| `CONFIG_APP_INFERENCE_USE_INT16_QUANT_MODEL` | Use the int16 quantized model interface. | `y` | Keep `y` for the current model. | `prj.conf` |
+| `CONFIG_APP_INFERENCE_DETECT_CONF_THRESH_PERCENT` | Detector confidence threshold. | Kconfig default `50` | Tune based on false positives / false negatives. | `Kconfig` |
+| `CONFIG_APP_LORAWAN_UPLINK_INTERVAL_MS` | LoRaWAN uplink interval. | `1800000` ms | Default is 30 minutes; tune by power budget and network capacity. | `prj.conf` |
+| `CONFIG_APP_GPS_UPLINK_WAIT_TIMEOUT_MS` | Time to wait for GPS before uplink. | `60000` ms | `30000~60000` ms is typical. | `prj.conf` |
+| `CONFIG_APP_WAKEUP_SRC_BUTTON` | Button wake source. | `y` | Keep `y` if manual wake is needed. | `prj.conf` |
+| `CONFIG_APP_WAKEUP_SRC_PERIODIC` | Periodic wake source. | `y` | Keep `y` for production. | `prj.conf` |
+| `CONFIG_APP_WAKEUP_SRC_COMM` | Communication-request wake source. | `y` | Keep `y` for production. | `prj.conf` |
+| `CONFIG_APP_WAKEUP_SRC_RTC_ALARM` | RTC alarm wake source. | `y` | Keep `y` for production. | `prj.conf` |
+| `CONFIG_APP_WAKEUP_SRC_SOUND` | External sound IRQ wake source. | `y` | Tune based on hardware false-trigger behavior. | `prj.conf` |
+| `CONFIG_APP_WAKEUP_SRC_LOW_BAT` | Low-battery protection trigger. | `y` | Keep `y` for production. | `prj.conf` |
+| `APP_LOW_BATTERY_MV` | Low-battery threshold. | `3500` mV | Tune according to battery and power policy. | `src/tasks.h` |
+| `APP_BOOT_GPS_SYNC_TIMEOUT_MS` | GPS time-sync wait during boot. | `180000` ms | Keep for outdoor deployment; shorten for debugging. | `src/main.c` |
+| `APP_DEEP_SLEEP_WAKE_SEC` | RTC wake period used when boot detects that the battery is still low and immediately powers down again. | `3600` s | If all low-battery recovery periods should match, align this with `DEEP_SLEEP_WAKE_PERIOD_MS`. | `src/main.c` |
+| `ACTIVE_BURST_MS` | ACTIVE window duration. | `10000` ms | Tune by capture window and power budget. | `src/power_fsm.c` |
+| `SUSPEND_TO_ACTIVE_PERIOD_MS` | SUSPEND-to-ACTIVE period. | `60000` ms | Current test value is 1 minute; increase for long-term deployment as needed. | `src/power_fsm.c` |
+| `DEEP_SLEEP_WAKE_PERIOD_MS` | Default RTC wake period when the low-power FSM enters DEEP_SLEEP. | `1800000` ms | Default is 30 minutes; runtime low-battery events use this value. | `src/power_fsm.c` |
+| `MIC_SAMPLE_FREQUENCY` | Audio sample rate. | `16000` Hz | Keep 16 kHz for the current model. | `src/microphone_task.c` |
+| `STORAGE_WAV_SAMPLE_RATE` | WAV file sample rate. | `16000` Hz | Keep in sync with the microphone sample rate. | `src/storage_task.c` |
+| `LORAWAN_APP_PORT` | LoRaWAN uplink port. | `2` | Keep cloud decoder in sync. | `src/lorawan_task.c` |
+| `WATCHDOG_TIMEOUT_MS` | Hardware watchdog timeout. | `24000` ms | Do not shorten unless blocking paths are fully understood. | `src/system_task.c` |
+| `DFU_READ_CHUNK_SIZE` | SD DFU read chunk size. | `4096` B | Keep default. | `src/dfu_task.c` |
+
+`APP_DEEP_SLEEP_WAKE_SEC` and `DEEP_SLEEP_WAKE_PERIOD_MS` are used on different
+paths. The former is used by `main.c` when the boot-time low-battery check fails
+and the device immediately powers down again. The latter is the default period
+used by `power_fsm.c` after the system is running and enters DEEP_SLEEP. They can
+be different, but if the product policy requires one low-battery recovery period,
+adjust both values together.
+
+Classifier labels are stored in
+[app_all_task/config/inference_labels.txt](app_all_task/config/inference_labels.txt).
+If labels are changed, update `CONFIG_APP_INFERENCE_LABEL_CNT` and the cloud
+payload decoder at the same time.
+
+### LoRaWAN Join Parameters
+
+LoRaWAN uses OTAA. The server-side configuration and firmware must use matching
+parameters:
+
+| Parameter | Source | Where to configure it |
+| --- | --- | --- |
+| `JoinEUI` | Assigned by the LoRaWAN network/application server. It may also be called `AppEUI`. | `join_eui[]` in [app_all_task/src/lorawan_task.c](app_all_task/src/lorawan_task.c). |
+| `AppKey` / `NwkKey` | 16-byte key generated by, or created for, the LoRaWAN server. The current code uses the same `app_key` as `nwk_key`. | `app_key[]` in [app_all_task/src/lorawan_task.c](app_all_task/src/lorawan_task.c). |
+| `DevEUI` | Device-unique ID. The firmware first loads it from `/dev.txt` on the SD card; if missing, it derives one from the MCU hardware ID and writes it back to `/dev.txt`. | Enter the same DevEUI when creating the device on the server. |
+
+Recommended flow:
+
+1. Create an application on the LoRaWAN server and obtain or set `JoinEUI` and `AppKey`.
+2. Fill `JoinEUI` and `AppKey` in `lorawan_task.c` using MSB-first byte order.
+3. Flash the firmware and open the serial log.
+4. On first boot, read the `Generated DevEUI`, `Loaded DevEUI`, or `Fallback DevEUI` log line.
+5. Enter that DevEUI in the server device profile / end-device page.
+6. If the SD card already contains `/dev.txt`, the same device will continue using that DevEUI.
+
+Example: if the server shows `JoinEUI = 0011223344556677`, configure it as:
+
+```c
+static uint8_t join_eui[] = {
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77
+};
+```
+
+Do not commit real production `AppKey`, `NwkKey`, or other secret keys to a
+public repository.
+
+MCUboot signature configuration is in
+[app_all_task/mcuboot_bird_ec256.conf](app_all_task/mcuboot_bird_ec256.conf).
+`CONFIG_BOOT_SIGNATURE_KEY_FILE` points to the signing private key; do not commit
+private keys to the repository.
+
+## Build and Flash
+
+### Build Environment
+
+The commands below assume the Zephyr workspace is `/home/jzhang/zephyrproject`
+and this repository is
+`/home/jzhang/zephyrproject/git/ambient-firmware-zephyr`.
+
+```bash
+cd /home/jzhang/zephyrproject
+source .venv/bin/activate
+
+REPO=/home/jzhang/zephyrproject/git/ambient-firmware-zephyr
+KEY=/home/jzhang/zephyrproject/keys/bird-mcuboot-ec256.pem
+MCUBOOT_CONF=$REPO/app_all_task/mcuboot_bird_ec256.conf
+STM32_CLI=/home/jzhang/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI
+```
+
+Check tools and key:
+
+```bash
+west --version
+imgtool version
+ls -l $KEY
+```
+
+If `west` is not found, the Python virtual environment is usually not active.
+
+### Initial PC Flashing
+
+For first-time flashing, or after changing the signing key, flash MCUboot with
+the matching public key first, then write the signed application image to slot0.
+Do not flash an unsigned `zephyr.bin` directly to the device.
+
+#### 1. Prepare the MCUboot overlay
+
+MCUboot must link to `boot_partition`. If this overlay does not already exist in
+the workspace, create it once:
+
+```bash
+mkdir -p bootloader/mcuboot/boot/zephyr/boards
+
+cat > bootloader/mcuboot/boot/zephyr/boards/stm32u5_bird.overlay <<'EOF'
+/ {
+    chosen {
+        zephyr,console = &usart2;
+        zephyr,shell-uart = &usart2;
+        zephyr,code-partition = &boot_partition;
+    };
+};
+EOF
+```
+
+For `stm32l496g_bird`, use the filename `stm32l496g_bird.overlay` with the same
+contents.
+
+#### 2. Optional full-chip erase
+
+A full-chip erase is recommended for first deployment:
+
+```bash
+$STM32_CLI -c port=SWD mode=UR -e all
+```
+
+#### 3. Build and flash signed-key MCUboot
+
+```bash
+west build -p always \
+  -b stm32u5_bird \
+  bootloader/mcuboot/boot/zephyr \
+  -d build_mcuboot_u5_ec256 \
+  -- -DBOARD_ROOT=$REPO -DEXTRA_CONF_FILE=$MCUBOOT_CONF
+
+west flash -d build_mcuboot_u5_ec256
+```
+
+Confirm that the MCUboot signature configuration is active:
+
+```bash
+grep -E "CONFIG_BOOT_SIGNATURE_TYPE|CONFIG_BOOT_SIGNATURE_KEY_FILE|CONFIG_BOOT_VALIDATE_SLOT0|CONFIG_BOOT_UPGRADE_ONLY" \
+  build_mcuboot_u5_ec256/zephyr/.config
+```
+
+You should see `CONFIG_BOOT_SIGNATURE_TYPE_ECDSA_P256=y` and the key path should
+match `$KEY`.
+
+#### 4. Build the application
+
+```bash
+west build -p always \
+  -b stm32u5_bird \
+  $REPO/app_all_task \
+  -d build_app_u5 \
+  -- -DBOARD_ROOT=$REPO -DDTS_ROOT=$REPO/app_all_task
+```
+
+#### 5. Sign the application
+
+```bash
+west sign -d build_app_u5 -t imgtool -- \
+  --key $KEY \
+  --overwrite-only \
+  --align 1
+```
+
+Use the generated signed files:
+
+```text
+build_app_u5/zephyr/zephyr.signed.bin
+build_app_u5/zephyr/zephyr.signed.hex
+```
+
+Do not use the unsigned `build_app_u5/zephyr/zephyr.bin` for production flashing
+or DFU.
+
+#### 6. Verify the signature
+
+```bash
+imgtool verify -k $KEY build_app_u5/zephyr/zephyr.signed.bin
+imgtool dumpinfo build_app_u5/zephyr/zephyr.signed.bin
+```
+
+Do not flash the image if `verify` fails.
+
+#### 7. Write the signed application to slot0
+
+The slot0 start address is `0x08010000`:
+
+```bash
+$STM32_CLI \
+  -c port=SWD \
+  -w build_app_u5/zephyr/zephyr.signed.bin 0x08010000 \
+  -v \
+  -rst
+```
+
+After reset, MCUboot verifies the slot0 signature. The application boots only if
+verification succeeds.
+
+#### L4 board
+
+For `stm32l496g_bird`, replace the following in the commands above:
+
+- `stm32u5_bird` with `stm32l496g_bird`
+- `build_mcuboot_u5_ec256` with `build_mcuboot_l4_ec256`
+- `build_app_u5` with `build_app_l4`
+
+The slot0 start address is still `0x08010000`.
+
+### SD-Card DFU Update
+
+Later updates do not require reflashing MCUboot. Build, sign, and verify the
+application, then place the signed `.bin` in the SD-card root as `update.bin`.
+
+#### 1. Generate the DFU file
+
+```bash
+cd /home/jzhang/zephyrproject
+source .venv/bin/activate
+
+REPO=/home/jzhang/zephyrproject/git/ambient-firmware-zephyr
+KEY=/home/jzhang/zephyrproject/keys/bird-mcuboot-ec256.pem
+
+west build -p always \
+  -b stm32u5_bird \
+  $REPO/app_all_task \
+  -d build_app_u5 \
+  -- -DBOARD_ROOT=$REPO -DDTS_ROOT=$REPO/app_all_task
+
+west sign -d build_app_u5 -t imgtool -- \
+  --key $KEY \
+  --overwrite-only \
+  --align 1
+
+imgtool verify -k $KEY build_app_u5/zephyr/zephyr.signed.bin
+```
+
+For L4, replace the board and build directory as described above.
+
+#### 2. Put the image on the SD card
+
+Place this file in the SD-card root and rename it to:
+
+```text
+update.bin
+```
+
+Source file:
+
+```text
+build_app_u5/zephyr/zephyr.signed.bin
+```
+
+The SD-card root should look like:
+
+```text
+/update.bin
+```
+
+#### 3. Device-side update flow
+
+1. Insert the SD card and boot the device, or let the device run until the next ACTIVE-exit check.
+2. The application checks `/SD:/update.bin`.
+3. The application writes the file into MCUboot slot1.
+4. The application requests a permanent upgrade and renames `update.bin` to `update.done`.
+5. The device reboots.
+6. MCUboot verifies the slot1 signature.
+7. If the signature is valid, MCUboot overwrites/starts the new firmware.
+
+Notes:
+
+- `update.bin` must be `zephyr.signed.bin`, not `zephyr.bin`.
+- `update.bin` must be signed with the private key matching the public key compiled into MCUboot.
+- U5 slot1 size is `0xE8000`; L4 slot1 size is `0x68000`.
+- Keep power stable during the update.
+- If the signature is wrong, the board target does not match, or the image is too large, MCUboot rejects the new image.
+
+## Devicetree Configuration
+
+This project combines the board base DTS with an application overlay:
+
+| Target | Base DTS | App overlay |
+| --- | --- | --- |
+| STM32L496 | [stm32l496g_bird/stm32l496g_bird.dts](stm32l496g_bird/stm32l496g_bird.dts) | [app_all_task/boards/stm32l496g_bird.overlay](app_all_task/boards/stm32l496g_bird.overlay) |
+| STM32U595R | [stm32u5_bird/stm32u5_bird.dts](stm32u5_bird/stm32u5_bird.dts) | [app_all_task/boards/stm32u5_bird.overlay](app_all_task/boards/stm32u5_bird.overlay) |
+
+Key configuration:
+
+- `zephyr,code-partition = &slot0_partition` in `chosen`, so the application links to MCUboot slot0.
+- `boot_partition`, `slot0_partition`, `slot1_partition`, `scratch_partition`, and `storage_partition` are defined in the base DTS files.
+- `USART2` is used as console/shell UART.
+- `SAI1_B` is used for ADC3101 audio capture, with default/sleep pinctrl states.
+- `SPI3` connects both LoRa SX1262 and the SPI SD card.
+- `I2C1` connects GPS/BME280; `I2C2` connects ADC3101/INA3221-related peripherals.
+- `v_periph`, GPS power GPIOs, and SPI/SD-related GPIOs are managed by `power_ctrl.c`.
+- Retained memory stores boot, low-battery, SD fuse, and related state. U5 uses backup SRAM; L4 uses the BBRAM binding.
+- RTC and LPTIM are used for low-power waiting, alarm wakeup, and system tick.
+
+Partition sizes:
+
+| Target | MCUboot | slot0 | slot1 | scratch | storage |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| STM32L496 | `0x10000` | `0x68000` | `0x68000` | `0x10000` | `0x10000` |
+| STM32U595R | `0x10000` | `0xE8000` | `0xE8000` | `0x10000` | `0x10000` |
+
+Custom bindings are in [app_all_task/dts/bindings](app_all_task/dts/bindings).
+They currently include `bird,power-ctrl-pins` and `bird,retained-bbram`.
+
+## LoRaWAN Event Payload
+
+LoRaWAN uses port `2`. The current payload format is "variable bucket count +
+fixed section".
+
+With the default configuration:
+
+- `CONFIG_APP_INFERENCE_LABEL_CNT=11`
+- bucket count `N = 12`
+- total length `1 + N + 23 = 36` bytes
+
+Byte 0 carries the bucket count, so the cloud decoder should read `payload[0]`
+first instead of hard-coding the length.
+
+| Byte(s) | Field | Encoding |
+| --- | --- | --- |
+| `0` | `bucket_count` | `N`, default `12`. |
+| `1..N` | inference buckets | Saturated `uint8` count for each bucket. |
+| `1+N .. 2+N` | battery voltage | `int16` big-endian, mV. |
+| `3+N .. 4+N` | solar voltage | `int16` big-endian, mV. |
+| `5+N` | temperature | 1 byte, interpret as signed integer, degC. |
+| `6+N .. 7+N` | total inference count | `uint16` big-endian, low 16 bits. |
+| `8+N .. 9+N` | battery current | `int16` big-endian, mA. |
+| `10+N .. 11+N` | solar current | `int16` big-endian, mA. |
+| `12+N` | SD status | `0` no recent write, `1` write succeeded, `2` SD fuse/backoff. |
+| `13+N .. 14+N` | latitude | Legacy 2-byte compressed coordinate format. |
+| `15+N .. 16+N` | longitude | Legacy 2-byte compressed coordinate format. |
+| `17+N .. 18+N` | average RMS | Legacy 2-byte compressed RMS format. |
+| `19+N` | SD usage | `uint8`, percentage `0..100`. |
+| `20+N .. 21+N` | duty-cycle fail count | `uint16` big-endian, cumulative since boot. |
+| `22+N .. 23+N` | dropped window count | `uint16` big-endian, cumulative since boot. |
+
+With the default `N=12`, the fixed section starts at byte `13`, and the total
+payload covers bytes `0..35`.
+
+Default bucket meanings:
+
+| Bucket | Meaning |
+| ---: | --- |
+| `0` | Eurasian Blackcap |
+| `1` | Eurasian Wren |
+| `2` | European Robin |
+| `3` | Common Chaffinch |
+| `4` | Eurasian Blackbird |
+| `5` | Common Chiffchaff |
+| `6` | Great Tit |
+| `7` | Short-toed Treecreeper |
+| `8` | Great Spotted Woodpecker |
+| `9` | Long-tailed Tit |
+| `10` | not_target |
+| `11` | Detector reported bird, but confidence was below the threshold. |
+
+## FAQ
+
+**The application does not boot after flashing**
+
+Check that MCUboot was built with the same key, and that slot0 contains
+`zephyr.signed.bin` at address `0x08010000`.
+
+**DFU did not upgrade the firmware**
+
+Confirm that the SD-card root file is named `update.bin`, that it comes from
+`zephyr.signed.bin`, and that `imgtool verify -k $KEY update.bin` passes.
+
+**I only want to debug the microphone and avoid GPS/LoRaWAN waits**
+
+Set this in `prj.conf`:
+
+```conf
+CONFIG_APP_MICROPHONE_DEBUG_SKIP_GPS_LORA=y
+```
+
+Set it back to `n` after debugging.
