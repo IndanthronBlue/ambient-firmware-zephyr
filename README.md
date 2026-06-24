@@ -203,6 +203,31 @@ The firmware repository is the manifest repository at
 `git/ambient-firmware-zephyr`. The board definitions remain in this repository
 and are made visible to Zephyr builds through `BOARD_ROOT`.
 
+## Required Zephyr Modules
+
+[west.yml](west.yml) lists only the top-level `zephyr` project and uses
+`import: true`. This intentionally imports Zephyr's official module manifest, so
+`west update` fetches the Zephyr components needed by this firmware.
+
+The most important projects are:
+
+| Project | Workspace path | Why this firmware needs it |
+| --- | --- | --- |
+| `zephyr` | `zephyr` | RTOS kernel, build system, drivers, Kconfig, Devicetree, STM32 SoC support. |
+| `hal_stm32` | `modules/hal/stm32` | STM32Cube HAL/LL sources and STM32 pinctrl Devicetree include files. |
+| `mcuboot` | `bootloader/mcuboot` | Signed bootloader, bootutil library, and `imgtool` signing utilities. |
+| `cmsis` | `modules/hal/cmsis` | ARM CMSIS headers used by Cortex-M, DSP, and STM32 support code. |
+| `cmsis-dsp` | `modules/lib/cmsis-dsp` | MFCC and DSP math used by the audio inference frontend. |
+| `loramac-node` | `modules/lib/loramac-node` | LoRaWAN MAC stack used by Zephyr's LoRaWAN subsystem. |
+| `fatfs` | `modules/fs/fatfs` | FAT filesystem support for the SD-card audio and DFU files. |
+| `mbedtls` | `modules/crypto/mbedtls` | Crypto dependency pulled by Zephyr/MCUboot-related security components. |
+
+After `west update`, verify that these projects are present:
+
+```bash
+west list zephyr mcuboot hal_stm32 cmsis cmsis-dsp loramac-node fatfs mbedtls
+```
+
 ## Install Zephyr Environment
 
 Install host packages:
@@ -253,7 +278,7 @@ source /home/usr_name/zephyrproject/.venv/bin/activate
 cd /home/usr_name/zephyrproject
 
 west --version
-west list zephyr mcuboot hal_stm32 loramac-node
+west list zephyr mcuboot hal_stm32 cmsis cmsis-dsp loramac-node fatfs mbedtls
 python -m imgtool.main version
 ```
 
