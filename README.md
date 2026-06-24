@@ -184,6 +184,9 @@ This repository provides a west manifest in [west.yml](west.yml). It pins the
 Zephyr tree used by this firmware and imports Zephyr's own module manifest, so a
 new machine can recreate the same workspace layout without manually choosing a
 Zephyr branch.
+The `zephyr` project in the manifest is fetched from the official
+`zephyrproject-rtos/zephyr` repository; this firmware repository is only the
+manifest/self repository.
 
 The manifest creates this layout:
 
