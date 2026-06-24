@@ -10,9 +10,9 @@ Firmware for the AMBIENT bird-monitoring node based on the
 [LEAT-EDGE/ambient](https://github.com/LEAT-EDGE/ambient) open hardware.
 This Zephyr firmware has been tested on STM32L496 and STM32U595R MCUs:
 STM32L496 uses the Zephyr board `stm32l496g_bird` and Devicetree file
-[stm32l496g_bird/stm32l496g_bird.dts](stm32l496g_bird/stm32l496g_bird.dts);
+[boards/st/stm32l496g_bird/stm32l496g_bird.dts](boards/st/stm32l496g_bird/stm32l496g_bird.dts);
 STM32U595R uses the Zephyr board `stm32u5_bird` and Devicetree file
-[stm32u5_bird/stm32u5_bird.dts](stm32u5_bird/stm32u5_bird.dts). The firmware
+[boards/st/stm32u5_bird/stm32u5_bird.dts](boards/st/stm32u5_bird/stm32u5_bird.dts). The firmware
 wakes periodically, records audio, stores audio files, runs bird recognition,
 sends a LoRaWAN summary, and then returns to a low-power state.
 
@@ -65,8 +65,8 @@ Main features:
 | [app_all_task/config](app_all_task/config) | Application data files, currently including the inference label list. |
 | [app_all_task/boards](app_all_task/boards) | Application overlays and board-specific configuration files. |
 | [app_all_task/dts/bindings](app_all_task/dts/bindings) | Custom Devicetree bindings used by this application. |
-| [stm32l496g_bird](stm32l496g_bird) | STM32L496 board definition and base Devicetree. |
-| [stm32u5_bird](stm32u5_bird) | STM32U595R board definition and base Devicetree. |
+| [boards/st/stm32l496g_bird](boards/st/stm32l496g_bird) | STM32L496 board definition and base Devicetree. |
+| [boards/st/stm32u5_bird](boards/st/stm32u5_bird) | STM32U595R board definition and base Devicetree. |
 
 ## How It Runs
 
@@ -175,6 +175,186 @@ MCUboot signature configuration is in
 [app_all_task/mcuboot_bird_ec256.conf](app_all_task/mcuboot_bird_ec256.conf).
 `CONFIG_BOOT_SIGNATURE_KEY_FILE` points to the signing private key; do not commit
 private keys to the repository.
+
+## Zephyr Workspace Manifest
+
+This repository provides a west manifest in [west.yml](west.yml). It pins the
+Zephyr tree used by this firmware and imports Zephyr's own module manifest, so a
+new machine can recreate the same workspace layout without manually choosing a
+Zephyr branch.
+
+The manifest creates this layout:
+
+```text
+/home/usr_name/zephyrproject/
+├── .west/
+├── zephyr/
+├── modules/
+├── bootloader/mcuboot/
+└── git/ambient-firmware-zephyr/
+```
+
+The firmware repository is the manifest repository at
+`git/ambient-firmware-zephyr`. The board definitions remain in this repository
+and are made visible to Zephyr builds through `BOARD_ROOT`.
+
+## Install Zephyr Environment
+
+Install host packages:
+
+```bash
+sudo apt update
+sudo apt install --no-install-recommends \
+  git cmake ninja-build gperf ccache dfu-util device-tree-compiler \
+  wget xz-utils file make gcc gcc-multilib g++-multilib \
+  python3 python3-dev python3-pip python3-venv \
+  libsdl2-dev libmagic1
+```
+
+Create a workspace from this repository's manifest:
+
+```bash
+mkdir -p /home/usr_name
+cd /home/usr_name
+
+python3 -m venv zephyrproject/.venv
+source zephyrproject/.venv/bin/activate
+pip install --upgrade pip west
+
+FIRMWARE_REPO_URL="https://example.com/path/to/ambient-firmware-zephyr.git"
+west init -m $FIRMWARE_REPO_URL --mf west.yml /home/usr_name/zephyrproject
+
+cd /home/usr_name/zephyrproject
+west update
+west zephyr-export
+pip install -r zephyr/scripts/requirements.txt
+pip install -r bootloader/mcuboot/scripts/requirements.txt
+```
+
+Run `west update` before the first build. The STM32 pinctrl Devicetree include
+files come from the `hal_stm32` module, and the application also uses imported
+modules such as MCUboot, LoRaMac-node, CMSIS-DSP, and FatFs.
+
+Install the Zephyr SDK toolchain:
+
+```bash
+west sdk install
+```
+
+Check the environment:
+
+```bash
+source /home/usr_name/zephyrproject/.venv/bin/activate
+cd /home/usr_name/zephyrproject
+
+west --version
+west list zephyr mcuboot hal_stm32 loramac-node
+python -m imgtool.main version
+```
+
+If `west` or `imgtool` is not found, the Python virtual environment is not
+active or the Python requirements were not installed.
+
+## Generate Signing Keys
+
+MCUboot verifies application images with the public key compiled into the
+bootloader. The application image must be signed with the matching private key.
+Generate one EC P-256 key pair per product key family and keep the private key
+outside the git repository:
+
+```bash
+cd /home/usr_name/zephyrproject
+source .venv/bin/activate
+
+mkdir -p /home/usr_name/zephyrproject/keys
+python -m imgtool.main keygen \
+  -k /home/usr_name/zephyrproject/keys/bird-mcuboot-ec256.pem \
+  -t ecdsa-p256
+
+chmod 600 /home/usr_name/zephyrproject/keys/bird-mcuboot-ec256.pem
+python -m imgtool.main getpub \
+  -k /home/usr_name/zephyrproject/keys/bird-mcuboot-ec256.pem
+python -m imgtool.main getpubhash \
+  -k /home/usr_name/zephyrproject/keys/bird-mcuboot-ec256.pem
+```
+
+The current configuration expects this key path:
+
+```text
+/home/usr_name/zephyrproject/keys/bird-mcuboot-ec256.pem
+```
+
+It is referenced by:
+
+- `CONFIG_BOOT_SIGNATURE_KEY_FILE` in
+  [app_all_task/mcuboot_bird_ec256.conf](app_all_task/mcuboot_bird_ec256.conf),
+  used when building MCUboot.
+- `CONFIG_MCUBOOT_SIGNATURE_KEY_FILE` in
+  [app_all_task/prj.conf](app_all_task/prj.conf), used when building the signed
+  application image.
+
+If a different key path is used, update both Kconfig entries and rebuild
+MCUboot and the application. After changing the key, every device must receive
+the new MCUboot image first; otherwise the old bootloader will reject images
+signed by the new private key.
+
+Never commit private signing keys, LoRaWAN AppKeys, or production server tokens
+to this repository.
+
+## Board Configuration And Local Backends
+
+The board definitions are stored out-of-tree in this repository:
+
+```text
+git/ambient-firmware-zephyr/boards/st/stm32l496g_bird/
+git/ambient-firmware-zephyr/boards/st/stm32u5_bird/
+```
+
+Do not copy these board directories into `zephyr/boards/st` for normal
+development. Keep the Zephyr tree clean and expose the boards at build time with
+`BOARD_ROOT`:
+
+```bash
+cd /home/usr_name/zephyrproject
+source .venv/bin/activate
+
+REPO=/home/usr_name/zephyrproject/git/ambient-firmware-zephyr
+
+west build -p always \
+  -b stm32u5_bird \
+  $REPO/app_all_task \
+  -d build_app_u5 \
+  -- -DBOARD_ROOT=$REPO -DDTS_ROOT=$REPO/app_all_task
+```
+
+Use the same pattern for L4 by replacing `stm32u5_bird` with
+`stm32l496g_bird` and `build_app_u5` with `build_app_l4`.
+
+The L4 retained-memory backend is also provided by this repository:
+
+```text
+git/ambient-firmware-zephyr/app_all_task/src/drivers/retained_mem_bbram.c
+git/ambient-firmware-zephyr/app_all_task/dts/bindings/retained_mem/bird,retained-bbram.yaml
+```
+
+It is compiled by [app_all_task/CMakeLists.txt](app_all_task/CMakeLists.txt)
+only when Devicetree enables a `bird,retained-bbram` node. This means L4
+retention works without patching Zephyr's `drivers/retained_mem/CMakeLists.txt`.
+An L4 build can still print Zephyr's
+`No SOURCES given to Zephyr library: drivers__retained_mem` warning; that is
+harmless here because the `bird,retained-bbram` backend is built as application
+source.
+
+After setting up or updating a workspace, check that the upstream Zephyr tree has
+no product-specific local changes:
+
+```bash
+git -C zephyr status --short
+```
+
+The command should print nothing. If a previous local workspace contains copied
+board directories or an old retained-memory backend under `zephyr/`, remove those
+local changes and rebuild from this repository with `BOARD_ROOT` and `DTS_ROOT`.
 
 ## Build and Flash
 
@@ -389,8 +569,8 @@ This project combines the board base DTS with an application overlay:
 
 | Target | Base DTS | App overlay |
 | --- | --- | --- |
-| STM32L496 | [stm32l496g_bird/stm32l496g_bird.dts](stm32l496g_bird/stm32l496g_bird.dts) | [app_all_task/boards/stm32l496g_bird.overlay](app_all_task/boards/stm32l496g_bird.overlay) |
-| STM32U595R | [stm32u5_bird/stm32u5_bird.dts](stm32u5_bird/stm32u5_bird.dts) | [app_all_task/boards/stm32u5_bird.overlay](app_all_task/boards/stm32u5_bird.overlay) |
+| STM32L496 | [boards/st/stm32l496g_bird/stm32l496g_bird.dts](boards/st/stm32l496g_bird/stm32l496g_bird.dts) | [app_all_task/boards/stm32l496g_bird.overlay](app_all_task/boards/stm32l496g_bird.overlay) |
+| STM32U595R | [boards/st/stm32u5_bird/stm32u5_bird.dts](boards/st/stm32u5_bird/stm32u5_bird.dts) | [app_all_task/boards/stm32u5_bird.overlay](app_all_task/boards/stm32u5_bird.overlay) |
 
 Key configuration:
 

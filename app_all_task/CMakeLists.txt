@@ -94,3 +94,9 @@ target_sources(app PRIVATE
     src/retained_state.c
     src/power_ctrl.c
 )
+
+if(CONFIG_DT_HAS_BIRD_RETAINED_BBRAM_ENABLED)
+    target_sources(app PRIVATE
+        src/drivers/retained_mem_bbram.c
+    )
+endif()

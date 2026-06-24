@@ -1,0 +1,23 @@
+manifest:
+  version: "1.2"
+
+  remotes:
+    - name: ambient-zephyr
+      url-base: https://github.com/IndanthronBlue
+
+  defaults:
+    remote: ambient-zephyr
+
+  group-filter:
+    - -babblesim
+    - -optional
+    - -testing
+
+  projects:
+    - name: zephyr
+      repo-path: zephyr
+      revision: 8dc3c6f3b09019e6ab8b390e04d3edc93ccafd63
+      import: true
+
+  self:
+    path: git/ambient-firmware-zephyr
