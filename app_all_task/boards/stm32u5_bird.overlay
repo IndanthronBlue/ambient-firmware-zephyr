@@ -27,8 +27,8 @@
 	};
 
 	chosen {
-		zephyr,console = &usart2;
-		zephyr,shell-uart = &usart2;
+		zephyr,console = &cdc_acm_uart0;
+		zephyr,shell-uart = &cdc_acm_uart0;
 		zephyr,code-partition = &slot0_partition;
 		zephyr,retained-ram = &retained_mem;
 		zephyr,retained-mem = &app_retention;
@@ -61,6 +61,11 @@
 
 &backup_sram {
 	status = "okay";
+};
+
+&zephyr_udc0 {
+	/* PA11/PA12 use the embedded full-speed PHY; avoid invalid HS CDC descriptors. */
+	maximum-speed = "full-speed";
 };
 
 &{/soc/pin-controller@42020000} {

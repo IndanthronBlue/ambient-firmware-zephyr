@@ -78,7 +78,9 @@ After power-on, the device automatically:
 4. Sends one summary payload over LoRaWAN when the uplink interval is reached.
 5. Enters low power or deep sleep when needed, and wakes through RTC or configured wake sources.
 
-Typical serial log monitoring:
+Typical serial log monitoring. On STM32U595R, application logs are routed to
+USB CDC ACM and usually appear as `/dev/ttyACM0`; the baud rate is ignored by
+USB CDC but `115200` is a safe terminal setting.
 
 ```bash
 minicom -D /dev/ttyACM0 -b 115200
@@ -576,7 +578,8 @@ Key configuration:
 
 - `zephyr,code-partition = &slot0_partition` in `chosen`, so the application links to MCUboot slot0.
 - `boot_partition`, `slot0_partition`, `slot1_partition`, `scratch_partition`, and `storage_partition` are defined in the base DTS files.
-- `USART2` is used as console/shell UART.
+- STM32U595R routes the application console/shell to USB CDC ACM.
+- STM32L496 keeps `USART2` as the application console/shell UART.
 - `SAI1_B` is used for ADC3101 audio capture, with default/sleep pinctrl states.
 - `SPI3` connects both LoRa SX1262 and the SPI SD card.
 - `I2C1` connects GPS/BME280; `I2C2` connects ADC3101/INA3221-related peripherals.
