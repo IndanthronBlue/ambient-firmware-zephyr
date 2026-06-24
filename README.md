@@ -579,6 +579,8 @@ Key configuration:
 - `zephyr,code-partition = &slot0_partition` in `chosen`, so the application links to MCUboot slot0.
 - `boot_partition`, `slot0_partition`, `slot1_partition`, `scratch_partition`, and `storage_partition` are defined in the base DTS files.
 - STM32U595R routes the application console/shell to USB CDC ACM.
+- STM32U595R forces the USB device controller to full-speed so CDC ACM does not
+  advertise high-speed 512-byte bulk endpoints on a full-speed physical link.
 - STM32L496 keeps `USART2` as the application console/shell UART.
 - `SAI1_B` is used for ADC3101 audio capture, with default/sleep pinctrl states.
 - `SPI3` connects both LoRa SX1262 and the SPI SD card.
