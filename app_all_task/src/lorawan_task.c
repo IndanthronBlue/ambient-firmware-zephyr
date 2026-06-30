@@ -7,8 +7,8 @@
 #include <zephyr/device.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/lorawan/lorawan.h>
-#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/sys/byteorder.h>
+#include <stm32_ll_utils.h>
 #include <errno.h>
 #include <string.h>
 
@@ -56,6 +56,8 @@ static uint8_t app_key[]  = { 0x60, 0x3F, 0x36, 0x36, 0xA0, 0x39, 0x26, 0xAB, 0x
 #define TX_FIXED_OFF_DROPPED_WINDOW_COUNT  21U
 #define LORAWAN_CONFIRMED_EVERY_N       500U
 #define LORAWAN_CONFIRMED_FAIL_LIMIT    2U
+#define STM32_UID_WORD_COUNT            3U
+#define STM32_UID_BYTES_LEN             (STM32_UID_WORD_COUNT * sizeof(uint32_t))
 
 BUILD_ASSERT(TX_PAYLOAD_BUCKET_BYTES <= UINT8_MAX,
 	     "LoRa bucket count must fit in one payload byte");
@@ -237,16 +239,33 @@ static uint64_t lorawan_crc64_ecma(const uint8_t *data, size_t len)
 	return crc;
 }
 
+static void lorawan_store_be32(uint8_t out[sizeof(uint32_t)], uint32_t value)
+{
+	out[0] = (uint8_t)(value >> 24);
+	out[1] = (uint8_t)(value >> 16);
+	out[2] = (uint8_t)(value >> 8);
+	out[3] = (uint8_t)value;
+}
+
+static void lorawan_stm32_uid_to_canonical_bytes(const uint32_t uid[STM32_UID_WORD_COUNT],
+						 uint8_t out[STM32_UID_BYTES_LEN])
+{
+	lorawan_store_be32(&out[0], uid[2]);
+	lorawan_store_be32(&out[4], uid[1]);
+	lorawan_store_be32(&out[8], uid[0]);
+}
+
 static int lorawan_generate_dev_eui_from_hwid(uint8_t out_eui[8])
 {
-	uint8_t hwid[32];
-	ssize_t hwid_len = hwinfo_get_device_id(hwid, sizeof(hwid));
-	if (hwid_len <= 0) {
-		LOG_WRN("hwinfo_get_device_id failed (%d)", (int)hwid_len);
-		return -ENODATA;
-	}
+	uint32_t uid[STM32_UID_WORD_COUNT];
+	uint8_t uid8[STM32_UID_BYTES_LEN];
 
-	uint64_t derived = lorawan_crc64_ecma(hwid, (size_t)hwid_len);
+	uid[0] = LL_GetUID_Word0();
+	uid[1] = LL_GetUID_Word1();
+	uid[2] = LL_GetUID_Word2();
+	lorawan_stm32_uid_to_canonical_bytes(uid, uid8);
+
+	uint64_t derived = lorawan_crc64_ecma(uid8, sizeof(uid8));
 	memcpy(out_eui, &derived, sizeof(derived));
 
 	/* Locally administered bit set; keep deterministic per-device. */
