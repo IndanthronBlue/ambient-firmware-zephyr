@@ -37,6 +37,32 @@ config APP_MICROPHONE_DEBUG_SKIP_GPS_LORA
 	  GPS power toggling, LoRaWAN join, and LoRaWAN uplink calls are skipped so
 	  microphone tests are not blocked by radio/GNSS hardware behavior.
 
+config APP_LORAWAN_BOOT_UPLINK_DEBUG
+	bool "LoRaWAN debug: send one uplink immediately after startup join"
+	default n
+	help
+	  Send one diagnostic LoRaWAN uplink immediately after the startup join
+	  succeeds. This is intended to separate boot-time radio behavior from
+	  later GPS/power-FSM driven uplinks.
+
+config APP_LORAWAN_BOOT_REPEAT_UPLINK_DEBUG
+	bool "LoRaWAN debug: send a second startup uplink before power FSM"
+	default n
+	depends on APP_LORAWAN_BOOT_UPLINK_DEBUG
+	help
+	  After the immediate startup debug uplink succeeds, keep the boot path
+	  active, wait for APP_LORAWAN_BOOT_REPEAT_DELAY_MS, then send a second
+	  uplink using the same LoRaWAN session before GPS, comm worker, or the
+	  power FSM can drive another uplink.
+
+config APP_LORAWAN_BOOT_REPEAT_DELAY_MS
+	int "LoRaWAN debug repeat uplink delay"
+	default 60000
+	range 1000 600000
+	depends on APP_LORAWAN_BOOT_REPEAT_UPLINK_DEBUG
+	help
+	  Delay before sending the second startup debug uplink.
+
 config APP_STATUS_LED
 	bool "Enable low-power managed status LED"
 	default y
@@ -83,6 +109,29 @@ config APP_LORAWAN_UPLINK_INTERVAL_MS
 	range 1000 86400000
 	help
 	  Time window for one LoRaWAN telemetry packet. The default is 30 minutes.
+
+config APP_SUSPEND_TO_ACTIVE_PERIOD_MS
+	int "Suspend-to-active periodic wake interval"
+	default 30000
+	range 1000 86400000
+	help
+	  Periodic wake interval used by the active/suspend power FSM. The default
+	  is 30 seconds.
+
+config APP_LORAWAN_APP_KEY_HEX
+	string "LoRaWAN OTAA AppKey in hex"
+	default ""
+	help
+	  LoRaWAN OTAA AppKey as 32 hexadecimal characters, MSB first. Keep this
+	  value in a private build configuration when publishing the application.
+
+config APP_DEEP_SLEEP_WAKE_SEC
+	int "Deep sleep wake interval in seconds"
+	default 10800
+	range 30 86400
+	help
+	  RTC wake interval used for low-battery shutdown/recovery and default
+	  deep-sleep periods. The default is 3 hours.
 
 config APP_INFERENCE_DETECT_CONF_THRESH_PERCENT
 	int "Bird detector confidence threshold percent"

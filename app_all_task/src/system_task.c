@@ -33,6 +33,10 @@ static atomic_t watchdog_sd_op_active;
 static uint32_t watchdog_sd_op_start_ms;
 static uint32_t watchdog_sd_op_timeout_ms;
 static const char *watchdog_sd_op_name;
+static atomic_t watchdog_long_op_active;
+static uint32_t watchdog_long_op_start_ms;
+static uint32_t watchdog_long_op_timeout_ms;
+static const char *watchdog_long_op_name;
 static uint32_t watchdog_last_health_log_ms;
 
 static bool watchdog_elapsed_over(uint32_t now, uint32_t then, uint32_t limit_ms)
@@ -73,6 +77,21 @@ void task_watchdog_note_sd_op_end(void)
 	watchdog_sd_op_timeout_ms = 0U;
 }
 
+void task_watchdog_note_long_op_start(const char *op_name, uint32_t timeout_ms)
+{
+	watchdog_long_op_name = op_name;
+	watchdog_long_op_timeout_ms = timeout_ms;
+	watchdog_long_op_start_ms = k_uptime_get_32();
+	atomic_set(&watchdog_long_op_active, 1);
+}
+
+void task_watchdog_note_long_op_end(void)
+{
+	atomic_set(&watchdog_long_op_active, 0);
+	watchdog_long_op_name = NULL;
+	watchdog_long_op_timeout_ms = 0U;
+}
+
 static bool watchdog_health_ok(void)
 {
 	uint32_t now = k_uptime_get_32();
@@ -97,6 +116,15 @@ static bool watchdog_health_ok(void)
 			reason = watchdog_sd_op_name != NULL ? watchdog_sd_op_name : "sd_op";
 			age_ms = now - watchdog_sd_op_start_ms;
 			limit_ms = sd_timeout;
+		}
+	} else if (atomic_get(&watchdog_long_op_active) != 0) {
+		uint32_t op_timeout = watchdog_long_op_timeout_ms;
+
+		if ((op_timeout == 0U) ||
+		    watchdog_elapsed_over(now, watchdog_long_op_start_ms, op_timeout)) {
+			reason = watchdog_long_op_name != NULL ? watchdog_long_op_name : "long_op";
+			age_ms = now - watchdog_long_op_start_ms;
+			limit_ms = op_timeout;
 		}
 	}
 
@@ -154,6 +182,7 @@ int task_watchdog_init(void)
 	task_watchdog_mark_main_alive();
 	task_watchdog_set_comm_active(false);
 	task_watchdog_note_sd_op_end();
+	task_watchdog_note_long_op_end();
 	watchdog_last_health_log_ms = k_uptime_get_32();
 
 	LOG_INF("Watchdog started: timeout=%u ms channel=%d health-gated",

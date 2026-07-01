@@ -1,5 +1,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/pm/policy.h>
+#include <zephyr/pm/state.h>
 #include <zephyr/sys/atomic.h>
 
 #include "tasks.h"
@@ -17,6 +19,23 @@ static bool comm_started;
 #define COMM_PENDING_NO_GPS    BIT(0)
 #define COMM_PENDING_NEED_GPS  BIT(1)
 #define COMM_PENDING_WAIT_GPS  BIT(2)
+#define COMM_PM_POST_UPLINK_GRACE_MS 3000U
+
+static void comm_pm_lock_suspend_to_idle(void)
+{
+#if IS_ENABLED(CONFIG_PM)
+	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+	LOG_INF("Comm worker: SUSPEND_TO_IDLE locked during GPS/LoRa uplink");
+#endif
+}
+
+static void comm_pm_unlock_suspend_to_idle(void)
+{
+#if IS_ENABLED(CONFIG_PM)
+	pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+	LOG_INF("Comm worker: SUSPEND_TO_IDLE unlocked after GPS/LoRa uplink");
+#endif
+}
 
 static void comm_worker_thread(void *a, void *b, void *c)
 {
@@ -37,10 +56,14 @@ static void comm_worker_thread(void *a, void *b, void *c)
 		task_watchdog_mark_comm_alive();
 		power_fsm_request_wakeup(POWER_WAKE_SRC_COMM);
 
+		bool pm_locked = false;
 		if (task_lorawan_drop_uplink_if_backoff()) {
 			task_status_led_event(STATUS_LED_ERROR);
 			goto done;
 		}
+
+		comm_pm_lock_suspend_to_idle();
+		pm_locked = true;
 
 		bool require_gps = (pending & COMM_PENDING_NEED_GPS) != 0U;
 		bool wait_gps = (pending & COMM_PENDING_WAIT_GPS) != 0U;
@@ -77,6 +100,12 @@ static void comm_worker_thread(void *a, void *b, void *c)
 		}
 
 done:
+		if (pm_locked) {
+			task_watchdog_mark_comm_alive();
+			k_msleep(COMM_PM_POST_UPLINK_GRACE_MS);
+			task_watchdog_mark_comm_alive();
+			comm_pm_unlock_suspend_to_idle();
+		}
 		atomic_set(&comm_busy, 0);
 		task_watchdog_set_comm_active(false);
 	}

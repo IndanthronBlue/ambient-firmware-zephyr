@@ -2,11 +2,11 @@ manifest:
   version: "1.2"
 
   remotes:
-    - name: ambient-zephyr
-      url-base: https://github.com/IndanthronBlue
+    - name: zephyrproject
+      url-base: https://github.com/zephyrproject-rtos
 
   defaults:
-    remote: ambient-zephyr
+    remote: zephyrproject
 
   group-filter:
     - -babblesim

@@ -184,6 +184,9 @@ This repository provides a west manifest in [west.yml](west.yml). It pins the
 Zephyr tree used by this firmware and imports Zephyr's own module manifest, so a
 new machine can recreate the same workspace layout without manually choosing a
 Zephyr branch.
+The `zephyr` project in the manifest is fetched from the official
+`zephyrproject-rtos/zephyr` repository; this firmware repository is only the
+manifest/self repository.
 
 The manifest creates this layout:
 
@@ -199,6 +202,31 @@ The manifest creates this layout:
 The firmware repository is the manifest repository at
 `git/ambient-firmware-zephyr`. The board definitions remain in this repository
 and are made visible to Zephyr builds through `BOARD_ROOT`.
+
+## Required Zephyr Modules
+
+[west.yml](west.yml) lists only the top-level `zephyr` project and uses
+`import: true`. This intentionally imports Zephyr's official module manifest, so
+`west update` fetches the Zephyr components needed by this firmware.
+
+The most important projects are:
+
+| Project | Workspace path | Why this firmware needs it |
+| --- | --- | --- |
+| `zephyr` | `zephyr` | RTOS kernel, build system, drivers, Kconfig, Devicetree, STM32 SoC support. |
+| `hal_stm32` | `modules/hal/stm32` | STM32Cube HAL/LL sources and STM32 pinctrl Devicetree include files. |
+| `mcuboot` | `bootloader/mcuboot` | Signed bootloader, bootutil library, and `imgtool` signing utilities. |
+| `cmsis` | `modules/hal/cmsis` | ARM CMSIS headers used by Cortex-M, DSP, and STM32 support code. |
+| `cmsis-dsp` | `modules/lib/cmsis-dsp` | MFCC and DSP math used by the audio inference frontend. |
+| `loramac-node` | `modules/lib/loramac-node` | LoRaWAN MAC stack used by Zephyr's LoRaWAN subsystem. |
+| `fatfs` | `modules/fs/fatfs` | FAT filesystem support for the SD-card audio and DFU files. |
+| `mbedtls` | `modules/crypto/mbedtls` | Crypto dependency pulled by Zephyr/MCUboot-related security components. |
+
+After `west update`, verify that these projects are present:
+
+```bash
+west list zephyr mcuboot hal_stm32 cmsis cmsis-dsp loramac-node fatfs mbedtls
+```
 
 ## Install Zephyr Environment
 
@@ -250,7 +278,7 @@ source /home/usr_name/zephyrproject/.venv/bin/activate
 cd /home/usr_name/zephyrproject
 
 west --version
-west list zephyr mcuboot hal_stm32 loramac-node
+west list zephyr mcuboot hal_stm32 cmsis cmsis-dsp loramac-node fatfs mbedtls
 python -m imgtool.main version
 ```
 
@@ -579,6 +607,8 @@ Key configuration:
 - `zephyr,code-partition = &slot0_partition` in `chosen`, so the application links to MCUboot slot0.
 - `boot_partition`, `slot0_partition`, `slot1_partition`, `scratch_partition`, and `storage_partition` are defined in the base DTS files.
 - STM32U595R routes the application console/shell to USB CDC ACM.
+- STM32U595R forces the USB device controller to full-speed so CDC ACM does not
+  advertise high-speed 512-byte bulk endpoints on a full-speed physical link.
 - STM32L496 keeps `USART2` as the application console/shell UART.
 - `SAI1_B` is used for ADC3101 audio capture, with default/sleep pinctrl states.
 - `SPI3` connects both LoRa SX1262 and the SPI SD card.
