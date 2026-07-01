@@ -152,7 +152,7 @@
 	v_periph: v-periph-ctrl {
 		compatible = "regulator-fixed";
 		regulator-name = "v-periph";
-		enable-gpios = <&gpiob 7 GPIO_ACTIVE_HIGH>;
+		enable-gpios = <&gpioc 13 GPIO_ACTIVE_HIGH>;
 		startup-delay-us = <2500>;
 		regulator-boot-on;
 	};
@@ -168,7 +168,6 @@
 	};
 
 	power_ctrl_pins: power-ctrl-pins {
-		sd-on-gpios = <&gpioc 13 GPIO_ACTIVE_HIGH>;
 		spi3-sck-gpios = <&gpioc 10 GPIO_ACTIVE_HIGH>;
 		spi3-mosi-gpios = <&gpioc 12 GPIO_ACTIVE_HIGH>;
 	};

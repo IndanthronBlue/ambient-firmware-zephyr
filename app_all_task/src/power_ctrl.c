@@ -19,6 +19,10 @@ LOG_MODULE_REGISTER(power_ctrl, LOG_LEVEL_INF);
 
 #define VPERIPH_MIN_OFF_MS     50U
 #define VPERIPH_RAIL_SETTLE_MS 250U
+#define LORA_RESET_PRE_MS      2U
+#define LORA_RESET_ASSERT_MS   10U
+#define LORA_RESET_RELEASE_MS  20U
+#define LORA_BUSY_TIMEOUT_MS   100U
 
 /*
 #if DT_NODE_HAS_STATUS(DT_NODELABEL(v_periph), okay)
@@ -416,9 +420,9 @@ static void power_ctrl_park_vperiph_gpio(void)
 	power_ctrl_gpio_disconnect(&spi3_sck_gpio, "spi3_sck");
 	power_ctrl_gpio_disconnect(&spi3_mosi_gpio, "spi3_mosi");
 	power_ctrl_gpio_disconnect(&spi3_miso_gpio, "spi3_miso");
-	/* LoRa is powered outside v_periph on this hardware. Keep active-low
-	 * NSS pulled high during suspend so the radio cannot float selected and
-	 * disturb the shared SPI/SD lines.
+	/* LoRa follows v_periph on this hardware. Keep active-low NSS pulled high
+	 * during suspend so the unpowered radio cannot float selected and disturb
+	 * the shared SPI/SD lines.
 	 */
 	power_ctrl_gpio_pull_up_and_hold_lp(&spi3_cs_lora, "spi3_cs_lora");
 	/* Keep SD CS high-Z while v_periph is off so an inserted card is not
@@ -456,6 +460,72 @@ static void power_ctrl_restore_vperiph_gpio(void)
 	power_ctrl_gpio_restore_input(&lora_busy, "lora_busy");
 	power_ctrl_gpio_restore_output_inactive(&lora_rxen, "lora_rxen");
 	power_ctrl_gpio_restore_input(&lora_dio1, "lora_dio1");
+}
+
+static int power_ctrl_lora_reset_pulse(void)
+{
+	if ((lora_reset.port == NULL) || !gpio_is_ready_dt(&lora_reset)) {
+		LOG_WRN("lora_reset GPIO not ready");
+		return -ENODEV;
+	}
+
+	int ret = gpio_pin_configure_dt(&lora_reset, GPIO_OUTPUT_INACTIVE);
+	if (ret < 0) {
+		LOG_ERR("lora_reset configure inactive failed: %d", ret);
+		return ret;
+	}
+
+	k_msleep(LORA_RESET_PRE_MS);
+
+	ret = gpio_pin_set_dt(&lora_reset, 1);
+	if (ret < 0) {
+		LOG_ERR("lora_reset assert failed: %d", ret);
+		return ret;
+	}
+
+	k_msleep(LORA_RESET_ASSERT_MS);
+
+	ret = gpio_pin_set_dt(&lora_reset, 0);
+	if (ret < 0) {
+		LOG_ERR("lora_reset release failed: %d", ret);
+		return ret;
+	}
+
+	k_msleep(LORA_RESET_RELEASE_MS);
+	LOG_INF("LoRa radio reset pulse complete");
+	return 0;
+}
+
+static int power_ctrl_lora_wait_busy_low(void)
+{
+	if ((lora_busy.port == NULL) || !gpio_is_ready_dt(&lora_busy)) {
+		LOG_WRN("lora_busy GPIO not ready");
+		return -ENODEV;
+	}
+
+	int ret = gpio_pin_configure_dt(&lora_busy, GPIO_INPUT);
+	if (ret < 0) {
+		LOG_ERR("lora_busy input configure failed: %d", ret);
+		return ret;
+	}
+
+	int64_t deadline = k_uptime_get() + LORA_BUSY_TIMEOUT_MS;
+	while (k_uptime_get() < deadline) {
+		ret = gpio_pin_get_dt(&lora_busy);
+		if (ret < 0) {
+			LOG_ERR("lora_busy read failed: %d", ret);
+			return ret;
+		}
+		if (ret == 0) {
+			LOG_INF("LoRa radio BUSY low");
+			return 0;
+		}
+		k_msleep(1);
+	}
+
+	LOG_WRN("LoRa radio BUSY stayed high for %u ms",
+		(unsigned int)LORA_BUSY_TIMEOUT_MS);
+	return -ETIMEDOUT;
 }
 
 /**
@@ -657,6 +727,28 @@ int power_ctrl_vperiph_on(void)
 	return power_ctrl_vperiph_enable_common(true, false, false);
 }
 
+int power_ctrl_lora_radio_cold_start(void)
+{
+	int ret = power_ctrl_vperiph_on();
+	if (ret < 0) {
+		LOG_ERR("LoRa cold start failed to enable v_periph: %d", ret);
+		return ret;
+	}
+
+	ret = power_ctrl_lora_reset_pulse();
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = power_ctrl_lora_wait_busy_low();
+	if (ret < 0) {
+		return ret;
+	}
+
+	LOG_INF("LoRa radio cold start complete");
+	return 0;
+}
+
 /**
  * @brief Enable v_periph and restore only resources needed by I2C1.
  *
@@ -796,6 +888,8 @@ int power_ctrl_prepare_suspend(void)
 		LOG_WRN("Suspend prep keeps v_periph on: storage not safe (%d)", storage_ret);
 		return storage_ret;
 	}
+
+	task_lorawan_prepare_sleep();
 
 	int ret = power_ctrl_vperiph_off();
 	if ((ret < 0) && (ret != -ENODEV)) {

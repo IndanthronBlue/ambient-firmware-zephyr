@@ -68,6 +68,16 @@ file(WRITE "${APP_INFERENCE_LABELS_HEADER}"
 
 target_include_directories(app PRIVATE "${APP_INFERENCE_LABELS_GENERATED_DIR}")
 
+if(CONFIG_HAS_SEMTECH_LORAMAC)
+    target_include_directories(app PRIVATE
+        "${ZEPHYR_LORAMAC_NODE_MODULE_DIR}/src/boards"
+        "${ZEPHYR_LORAMAC_NODE_MODULE_DIR}/src/system"
+        "${ZEPHYR_LORAMAC_NODE_MODULE_DIR}/src/radio"
+        "${ZEPHYR_LORAMAC_NODE_MODULE_DIR}/src/mac"
+        "${ZEPHYR_LORAMAC_NODE_MODULE_DIR}/src/mac/region"
+    )
+endif()
+
 target_sources(app PRIVATE
     src/main.c
     src/app_state.c
@@ -86,6 +96,7 @@ target_sources(app PRIVATE
     src/i2c_task.c
     src/rtc_task.c
     src/system_task.c
+    src/watchdog_service.c
     src/status_led_task.c
     src/comm_task.c
     src/button_task.c
@@ -95,7 +106,8 @@ target_sources(app PRIVATE
     src/power_ctrl.c
 )
 
-if(CONFIG_DT_HAS_BIRD_RETAINED_BBRAM_ENABLED)
+if(CONFIG_DT_HAS_BIRD_RETAINED_BBRAM_ENABLED AND
+   NOT EXISTS "${ZEPHYR_BASE}/drivers/retained_mem/retained_mem_bbram.c")
     target_sources(app PRIVATE
         src/drivers/retained_mem_bbram.c
     )

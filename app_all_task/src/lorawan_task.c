@@ -9,6 +9,7 @@
 #include <zephyr/lorawan/lorawan.h>
 #include <zephyr/sys/byteorder.h>
 #include <stm32_ll_utils.h>
+#include <LoRaMac.h>
 #include <errno.h>
 #include <string.h>
 
@@ -20,8 +21,7 @@ LOG_MODULE_REGISTER(lorawan_task, LOG_LEVEL_INF);
 /* OTAA credentials (MSB first) */
 static uint8_t join_eui[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 static uint8_t dev_eui[]  = { 0xB2, 0x21, 0x56, 0xAD, 0xAD, 0x8A, 0x4F, 0xF2 };
-//603f3636a03926abe7521abe84049be2
-static uint8_t app_key[]  = { 0x60, 0x3F, 0x36, 0x36, 0xA0, 0x39, 0x26, 0xAB, 0xE7, 0x52, 0x1A, 0xBE, 0x84, 0x04, 0x9B, 0xE2 };
+static uint8_t app_key[16];
 
 #define LORAWAN_RETRY_1MIN_MS		(1 * 60 * 1000)
 #define LORAWAN_RETRY_5MIN_MS		(5 * 60 * 1000)
@@ -29,6 +29,7 @@ static uint8_t app_key[]  = { 0x60, 0x3F, 0x36, 0x36, 0xA0, 0x39, 0x26, 0xAB, 0x
 #define LORAWAN_RETRY_30MIN_MS		(30 * 60 * 1000)
 #define LORAWAN_JOIN_RETRY_DELAY_MS       15000U
 #define LORAWAN_WDT_FEED_SLICE_MS         1000U
+#define LORAWAN_SEND_MONITOR_TIMEOUT_MS   (3U * 60U * 1000U)
 #define LORAWAN_DUTY_BACKOFF_1_MS         (0.5 * 60 * 1000)
 #define LORAWAN_DUTY_BACKOFF_2_MS         (1 * 60 * 1000)
 #define LORAWAN_DUTY_BACKOFF_3_MS         (2 * 60 * 1000)
@@ -66,12 +67,17 @@ BUILD_ASSERT(TX_PAYLOAD_LENGTH <= UINT8_MAX,
 
 static bool lorawan_stack_started;
 static bool lorawan_session_joined;
+static bool lorawan_mac_initialized;
+static bool downlink_cb_registered;
 static bool dev_eui_initialized;
+static bool app_key_initialized;
 static int64_t next_join_deadline;
 static uint32_t init_fail_count;
 static uint8_t confirmed_fail_streak;
+#if IS_ENABLED(CONFIG_LORAWAN_NVM_NONE)
 static uint16_t last_dev_nonce;
 static uint32_t devnonce_prng_state;
+#endif
 static bool gps_cached_valid;
 static float gps_cached_latitude;
 static float gps_cached_longitude;
@@ -80,6 +86,32 @@ static uint8_t duty_cycle_fail_streak;
 static int64_t duty_cycle_backoff_until_ms;
 
 static struct lorawan_downlink_cb downlink_cb;
+
+static int lorawan_deinit_stack_for_poweroff(const char *reason)
+{
+	LoRaMacStatus_t status;
+
+	if (!lorawan_mac_initialized) {
+		return 0;
+	}
+
+	status = LoRaMacDeInitialization();
+	if (status != LORAMAC_STATUS_OK) {
+		LOG_WRN("LoRaWAN deinit skipped before poweroff (%s): status=%d",
+			reason, status);
+		LoRaMacReset();
+		status = LoRaMacDeInitialization();
+		if (status != LORAMAC_STATUS_OK) {
+			LOG_WRN("LoRaWAN deinit still busy after MAC reset (%s): status=%d",
+				reason, status);
+			return -EBUSY;
+		}
+	}
+
+	LOG_INF("LoRaWAN deinitialized before radio poweroff (%s)", reason);
+	lorawan_mac_initialized = false;
+	return 0;
+}
 
 static void lorawan_log_microphone_debug_skip(const char *operation)
 {
@@ -98,6 +130,100 @@ static void lorawan_reset_debug_session_state(void)
 	app_state.lorawan_joined = false;
 	confirmed_fail_streak = 0U;
 	next_join_deadline = k_uptime_get();
+}
+
+static int lorawan_hex_nibble(char c)
+{
+	if ((c >= '0') && (c <= '9')) {
+		return c - '0';
+	}
+	if ((c >= 'a') && (c <= 'f')) {
+		return c - 'a' + 10;
+	}
+	if ((c >= 'A') && (c <= 'F')) {
+		return c - 'A' + 10;
+	}
+	return -EINVAL;
+}
+
+static bool lorawan_hex_separator(char c)
+{
+	return (c == ':') || (c == '-') || (c == '_') || (c == ' ') || (c == '\t');
+}
+
+static int lorawan_parse_hex_bytes(const char *hex, uint8_t *out, size_t out_len)
+{
+	size_t out_pos = 0U;
+	int high_nibble = -1;
+
+	if ((hex == NULL) || (out == NULL)) {
+		return -EINVAL;
+	}
+
+	for (size_t i = 0U; hex[i] != '\0'; i++) {
+		if (lorawan_hex_separator(hex[i])) {
+			continue;
+		}
+
+		int nibble = lorawan_hex_nibble(hex[i]);
+		if (nibble < 0) {
+			return -EINVAL;
+		}
+
+		if (high_nibble < 0) {
+			high_nibble = nibble;
+			continue;
+		}
+
+		if (out_pos >= out_len) {
+			return -EINVAL;
+		}
+
+		out[out_pos++] = (uint8_t)((high_nibble << 4) | nibble);
+		high_nibble = -1;
+	}
+
+	if ((high_nibble >= 0) || (out_pos != out_len)) {
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static bool lorawan_key_is_valid(const uint8_t *key, size_t len)
+{
+	bool all_zero = true;
+	bool all_ff = true;
+
+	for (size_t i = 0U; i < len; i++) {
+		if (key[i] != 0U) {
+			all_zero = false;
+		}
+		if (key[i] != 0xFFU) {
+			all_ff = false;
+		}
+	}
+
+	return !all_zero && !all_ff;
+}
+
+static int lorawan_init_app_key_once(void)
+{
+	if (app_key_initialized) {
+		return 0;
+	}
+
+	int ret = lorawan_parse_hex_bytes(CONFIG_APP_LORAWAN_APP_KEY_HEX,
+					  app_key, sizeof(app_key));
+	if (ret < 0 || !lorawan_key_is_valid(app_key, sizeof(app_key))) {
+		LOG_ERR("Invalid LoRaWAN AppKey config: CONFIG_APP_LORAWAN_APP_KEY_HEX must be 32 non-zero hex chars");
+		memset(app_key, 0, sizeof(app_key));
+		return -EINVAL;
+	}
+
+	app_key_initialized = true;
+	LOG_INF("LoRaWAN AppKey loaded from Kconfig");
+	return 0;
 }
 
 static void lorawan_increment_u16(uint16_t *counter)
@@ -314,6 +440,7 @@ static void lorawan_init_dev_eui_once(void)
 	(void)task_storage_persist_dev_eui(dev_eui);
 }
 
+#if IS_ENABLED(CONFIG_LORAWAN_NVM_NONE)
 static uint16_t lorawan_random_devnonce(void)
 {
 	if (devnonce_prng_state == 0U) {
@@ -325,6 +452,82 @@ static uint16_t lorawan_random_devnonce(void)
 	devnonce_prng_state ^= devnonce_prng_state << 5;
 
 	return (uint16_t)devnonce_prng_state;
+}
+#endif
+
+static const char *lorawan_activation_to_str(ActivationType_t activation)
+{
+	switch (activation) {
+	case ACTIVATION_TYPE_NONE:
+		return "none";
+	case ACTIVATION_TYPE_ABP:
+		return "abp";
+	case ACTIVATION_TYPE_OTAA:
+		return "otaa";
+	default:
+		return "unknown";
+	}
+}
+
+static bool lorawan_restore_session_state(const char *reason)
+{
+#if IS_ENABLED(CONFIG_LORAWAN_NVM_NONE)
+	ARG_UNUSED(reason);
+	return false;
+#else
+	MibRequestConfirm_t mib_req = { 0 };
+	LoRaMacStatus_t status;
+	ActivationType_t activation;
+	uint32_t dev_addr = 0U;
+	uint32_t fcnt_up = 0U;
+	bool have_dev_addr = false;
+	bool have_fcnt = false;
+
+	mib_req.Type = MIB_NETWORK_ACTIVATION;
+	status = LoRaMacMibGetRequestConfirm(&mib_req);
+	if (status != LORAMAC_STATUS_OK) {
+		LOG_WRN("LoRaWAN restored-session check failed (%s): activation status=%d",
+			reason, status);
+		return false;
+	}
+
+	activation = mib_req.Param.NetworkActivation;
+	if (activation == ACTIVATION_TYPE_NONE) {
+		LOG_INF("LoRaWAN no persisted session to restore (%s)", reason);
+		lorawan_session_joined = false;
+		app_state.lorawan_joined = false;
+		return false;
+	}
+
+	mib_req.Type = MIB_DEV_ADDR;
+	status = LoRaMacMibGetRequestConfirm(&mib_req);
+	if (status == LORAMAC_STATUS_OK) {
+		dev_addr = mib_req.Param.DevAddr;
+		have_dev_addr = true;
+	}
+
+	mib_req.Type = MIB_NVM_CTXS;
+	status = LoRaMacMibGetRequestConfirm(&mib_req);
+	if ((status == LORAMAC_STATUS_OK) && (mib_req.Param.Contexts != NULL)) {
+		fcnt_up = mib_req.Param.Contexts->Crypto.FCntList.FCntUp;
+		have_fcnt = true;
+	}
+
+	lorawan_session_joined = true;
+	app_state.lorawan_joined = true;
+	confirmed_fail_streak = 0U;
+	init_fail_count = 0U;
+	next_join_deadline = k_uptime_get();
+
+	LOG_INF("LoRaWAN session restored from NVM (%s): activation=%s",
+		reason, lorawan_activation_to_str(activation));
+	if (have_dev_addr || have_fcnt) {
+		LOG_INF("LoRaWAN restored context detail: DevAddr=0x%08x FCntUp=%u",
+			(unsigned int)dev_addr, (unsigned int)fcnt_up);
+	}
+
+	return true;
+#endif
 }
 
 static void lorawan_invalidate_session(const char *reason)
@@ -410,6 +613,18 @@ static int lorawan_start_stack(void)
 
 	lorawan_init_dev_eui_once();
 
+	ret = power_ctrl_lora_radio_cold_start();
+	if (ret < 0) {
+		LOG_ERR("LoRa radio cold start failed (%d)", ret);
+		return ret;
+	}
+
+	ret = lorawan_deinit_stack_for_poweroff("restart before start");
+	if (ret < 0) {
+		LOG_WRN("LoRaWAN restart blocked by active MAC state (%d)", ret);
+		return ret;
+	}
+
 	if (!device_is_ready(lora_dev)) {
 		LOG_ERR("SX126x radio not ready");
 		return -ENODEV;
@@ -427,11 +642,15 @@ static int lorawan_start_stack(void)
 		LOG_ERR("lorawan_start failed (%d)", ret);
 		return ret;
 	}
+	lorawan_mac_initialized = true;
 	LOG_INF("LoRaWAN stack started");
 
-	downlink_cb.port = LW_RECV_PORT_ANY;
-	downlink_cb.cb = lorawan_on_downlink;
-	lorawan_register_downlink_callback(&downlink_cb);
+	if (!downlink_cb_registered) {
+		downlink_cb.port = LW_RECV_PORT_ANY;
+		downlink_cb.cb = lorawan_on_downlink;
+		lorawan_register_downlink_callback(&downlink_cb);
+		downlink_cb_registered = true;
+	}
 	lorawan_enable_adr(true);
 
 	ret = lorawan_set_conf_msg_tries(1U);
@@ -440,6 +659,8 @@ static int lorawan_start_stack(void)
 	}
 	LOG_INF("LoRaWAN ADR enabled, confirm retries=%u", 1U);
 
+	(void)lorawan_restore_session_state("stack start");
+
 	return 0;
 }
 
@@ -447,14 +668,23 @@ static int lorawan_attempt_join(void)
 {
 	struct lorawan_join_config join_cfg = { 0 };
 	int ret;
+#if IS_ENABLED(CONFIG_LORAWAN_NVM_NONE)
 	uint16_t dev_nonce;
+#endif
 
 	join_cfg.mode = LORAWAN_ACT_OTAA;
 	join_cfg.dev_eui = dev_eui;
 	join_cfg.otaa.join_eui = join_eui;
+
+	ret = lorawan_init_app_key_once();
+	if (ret < 0) {
+		app_state.lorawan_last_error = ret;
+		return ret;
+	}
 	join_cfg.otaa.app_key = app_key;
 	join_cfg.otaa.nwk_key = app_key;
 
+#if IS_ENABLED(CONFIG_LORAWAN_NVM_NONE)
 	ret = task_storage_reserve_lorawan_dev_nonce(lorawan_random_devnonce(), &dev_nonce);
 	if (ret < 0) {
 		LOG_ERR("Failed to reserve persistent DevNonce (%d)", ret);
@@ -473,6 +703,12 @@ static int lorawan_attempt_join(void)
 
 	LOG_INF("LoRaWAN join attempt #%u (dev_nonce=%u)",
 		app_state.lorawan_join_attempts, (unsigned int)dev_nonce);
+#else
+	app_state.lorawan_join_attempts++;
+
+	LOG_INF("LoRaWAN join attempt #%u (DevNonce managed by LoRaWAN NVM)",
+		app_state.lorawan_join_attempts);
+#endif
 
 	task_watchdog_feed();
 	ret = lorawan_join(&join_cfg);
@@ -645,9 +881,20 @@ static int lorawan_send_uplink(void)
 		(unsigned int)max_next_payload_size,
 		(unsigned int)max_payload_size);
 
+	uint32_t send_start_ms = k_uptime_get_32();
+	LOG_INF("lorawan_send start (%s uplink, monitor_timeout=%u ms)",
+		msg_type_name,
+		(unsigned int)LORAWAN_SEND_MONITOR_TIMEOUT_MS);
+	task_watchdog_mark_comm_alive();
+	task_watchdog_note_long_op_start("lorawan_send", LORAWAN_SEND_MONITOR_TIMEOUT_MS);
 	task_watchdog_feed();
 	ret = lorawan_send(LORAWAN_APP_PORT, payload, len, msg_type);
+	task_watchdog_note_long_op_end();
+	task_watchdog_mark_comm_alive();
 	task_watchdog_feed();
+	uint32_t send_elapsed_ms = k_uptime_get_32() - send_start_ms;
+	LOG_INF("lorawan_send returned ret=%d elapsed=%u ms",
+		ret, (unsigned int)send_elapsed_ms);
 	if (ret == -EAGAIN) {
 		LOG_WRN("lorawan_send busy, will retry (%s uplink)", msg_type_name);
 		return ret;
@@ -782,11 +1029,53 @@ int task_lorawan_send_event_uplink(void)
 	if (ret < 0) {
 		app_state.lorawan_last_error = ret;
 		LOG_WRN("LoRaWAN send failed (err=%d)", ret);
+		if (ret == -ETIMEDOUT) {
+			lorawan_stack_started = false;
+			lorawan_invalidate_session("uplink local confirm timeout");
+		}
 		task_status_led_event(STATUS_LED_ERROR);
 		return ret;
 	}
 	LOG_INF("LoRaWAN uplink event sent successfully");
 
+	app_state.lorawan_last_error = 0;
+	app_state.lorawan_uplink_count++;
+	app_state.sdon = task_storage_sd_fuse_active() ?
+		APP_SDON_FUSED : APP_SDON_NO_RECENT_WRITE;
+	task_status_led_event(STATUS_LED_LORA_OK);
+	return 0;
+}
+
+int task_lorawan_send_boot_debug_uplink(void)
+{
+	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED) {
+		lorawan_log_microphone_debug_skip("boot debug uplink");
+		lorawan_reset_debug_session_state();
+		app_state.lorawan_last_error = 0;
+		return 0;
+	}
+
+	if (!lorawan_stack_started || !lorawan_session_joined) {
+		LOG_WRN("LoRaWAN boot debug uplink skipped: stack_started=%u joined=%u",
+			(unsigned int)(lorawan_stack_started ? 1U : 0U),
+			(unsigned int)(lorawan_session_joined ? 1U : 0U));
+		return -ENOTCONN;
+	}
+
+	LOG_INF("LoRaWAN boot debug uplink: send immediately after startup join");
+	int ret = lorawan_send_uplink();
+	if (ret < 0) {
+		app_state.lorawan_last_error = ret;
+		LOG_WRN("LoRaWAN boot debug uplink failed (err=%d)", ret);
+		if (ret == -ETIMEDOUT) {
+			lorawan_stack_started = false;
+			lorawan_invalidate_session("boot debug uplink local confirm timeout");
+		}
+		task_status_led_event(STATUS_LED_ERROR);
+		return ret;
+	}
+
+	LOG_INF("LoRaWAN boot debug uplink sent successfully");
 	app_state.lorawan_last_error = 0;
 	app_state.lorawan_uplink_count++;
 	app_state.sdon = task_storage_sd_fuse_active() ?
@@ -821,6 +1110,11 @@ int task_lorawan_connect(void)
 		lorawan_stack_started = true;
 	}
 
+	if (lorawan_session_joined) {
+		LOG_INF("LoRaWAN startup connect: restored session already active");
+		return 0;
+	}
+
 	return lorawan_attempt_join();
 }
 
@@ -832,13 +1126,15 @@ void task_lorawan_prepare_sleep(void)
 		return;
 	}
 
-	/* Prepare LoRa state for deep-sleep/shutdown path.
-	 * Suspend-to-idle must keep the session valid, so callers should invoke
-	 * this only when entering deep sleep or full power-off.
-	 */
 	if (lorawan_stack_started || lorawan_session_joined) {
-		LOG_INF("LoRaWAN prepare sleep: invalidate stack/session for deep sleep");
+		if (IS_ENABLED(CONFIG_LORAWAN_NVM_NONE)) {
+			LOG_INF("LoRaWAN prepare sleep: invalidate stack/session before sleep");
+		} else {
+			LOG_INF("LoRaWAN prepare sleep: stop runtime stack; persisted session will be restored next wake");
+		}
 	}
+
+	(void)lorawan_deinit_stack_for_poweroff("prepare sleep");
 
 	lorawan_stack_started = false;
 	lorawan_session_joined = false;

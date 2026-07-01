@@ -16,15 +16,35 @@
 LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 
 #define APP_BOOT_COLD_POWERCYCLE_MS 1000U
-#define APP_DEEP_SLEEP_WAKE_SEC     (1U * 60U * 60U)
-// #define APP_DEEP_SLEEP_WAKE_SEC     (30U)
+#ifndef APP_DEEP_SLEEP_WAKE_SEC
+#define APP_DEEP_SLEEP_WAKE_SEC     CONFIG_APP_DEEP_SLEEP_WAKE_SEC
+#endif
 #define APP_BOOT_GPS_SYNC_TIMEOUT_MS (3U * 60U * 1000U)
 #define APP_BOOT_GPS_RETRY_DELAY_MS  5000U
+#define APP_BOOT_DEBUG_WAIT_SLICE_MS 1000U
 
 #define SLOT1_AREA_ID              FIXED_PARTITION_ID(slot1_partition)
 #define APP_STARTUP_I2C_SCAN_ENABLED 0
 
 static bool app_pm_boot_guard_locked;
+
+static void boot_debug_wait_with_watchdog_feed(uint32_t delay_ms)
+{
+	uint32_t remain_ms = delay_ms;
+
+	while (remain_ms > 0U) {
+		uint32_t slice_ms = (remain_ms > APP_BOOT_DEBUG_WAIT_SLICE_MS) ?
+			APP_BOOT_DEBUG_WAIT_SLICE_MS : remain_ms;
+
+		task_watchdog_mark_main_alive();
+		task_watchdog_feed();
+		k_msleep(slice_ms);
+		remain_ms -= slice_ms;
+	}
+
+	task_watchdog_mark_main_alive();
+	task_watchdog_feed();
+}
 
 static void app_pm_boot_guard_lock(void)
 {
@@ -321,8 +341,30 @@ int main(void)
 
 	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED) {
 		LOG_INF("[BOOT] microphone debug mode: skip startup LoRaWAN connect");
-	} else if (task_lorawan_connect() != 0) {
-		LOG_WRN("Startup LoRaWAN connect failed; will retry during runtime");
+	} else {
+		int startup_lora_ret = task_lorawan_connect();
+
+		if (startup_lora_ret != 0) {
+			LOG_WRN("Startup LoRaWAN connect failed; will retry during runtime");
+		} else if (APP_LORAWAN_BOOT_UPLINK_DEBUG_ENABLED) {
+			LOG_INF("[BOOT] LoRaWAN boot uplink debug enabled; send immediate uplink");
+			int boot_uplink_ret = task_lorawan_send_boot_debug_uplink();
+
+			if (boot_uplink_ret < 0) {
+				LOG_WRN("[BOOT] LoRaWAN boot debug uplink failed: %d", boot_uplink_ret);
+			} else if (APP_LORAWAN_BOOT_REPEAT_UPLINK_DEBUG_ENABLED) {
+				LOG_INF("[BOOT] LoRaWAN boot repeat debug enabled; wait %u ms before second uplink",
+					(unsigned int)CONFIG_APP_LORAWAN_BOOT_REPEAT_DELAY_MS);
+				boot_debug_wait_with_watchdog_feed(CONFIG_APP_LORAWAN_BOOT_REPEAT_DELAY_MS);
+				LOG_INF("[BOOT] LoRaWAN boot repeat debug: send second uplink on same session");
+				int repeat_uplink_ret = task_lorawan_send_boot_debug_uplink();
+
+				if (repeat_uplink_ret < 0) {
+					LOG_WRN("[BOOT] LoRaWAN boot repeat debug uplink failed: %d",
+						repeat_uplink_ret);
+				}
+			}
+		}
 	}
 
 	int wdt_ret = task_watchdog_init();

@@ -237,6 +237,7 @@ void task_dfu_check_and_apply_periodic(void);
 
 
 int task_lorawan_connect(void);
+int task_lorawan_send_boot_debug_uplink(void);
 int task_lorawan_send_event_uplink(void);
 bool task_lorawan_drop_uplink_if_backoff(void);
 
@@ -270,6 +271,8 @@ void task_watchdog_set_comm_active(bool active);
 void task_watchdog_mark_comm_alive(void);
 void task_watchdog_note_sd_op_start(const char *op_name, uint32_t timeout_ms);
 void task_watchdog_note_sd_op_end(void);
+void task_watchdog_note_long_op_start(const char *op_name, uint32_t timeout_ms);
+void task_watchdog_note_long_op_end(void);
 void task_system_periodic_reboot_check(void);
 
 
@@ -307,6 +310,7 @@ int power_ctrl_vperiph_on(void);
 int power_ctrl_vperiph_on_for_i2c1(void);
 int power_ctrl_vperiph_on_for_i2c2(void);
 int power_ctrl_vperiph_off(void);
+int power_ctrl_lora_radio_cold_start(void);
 int power_ctrl_gps_on(void);
 int power_ctrl_gps_off(void);
 int power_ctrl_prepare_suspend(void);
