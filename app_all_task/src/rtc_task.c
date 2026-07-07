@@ -48,6 +48,49 @@ static const struct device *const rtc_dev = DEVICE_DT_GET(DT_ALIAS(rtc));
 static int64_t rtc_default_seed_uptime_ms = -1;
 static bool rtc_storage_default_fallback_logged;
 
+#if defined(CONFIG_SOC_SERIES_STM32U5X)
+static void rtc_clear_shutdown_wakeup_flags(const char *reason)
+{
+	bool alra_was_active = false;
+	bool wut_was_active = false;
+
+	if (!device_is_ready(rtc_dev)) {
+		return;
+	}
+
+	LL_PWR_EnableBkUpAccess();
+	LL_RTC_DisableWriteProtection(RTC);
+
+#if defined(RTC_SR_ALRAF)
+	alra_was_active = LL_RTC_IsActiveFlag_ALRA(RTC) != 0U;
+	if (alra_was_active) {
+		LL_RTC_ClearFlag_ALRA(RTC);
+	}
+#endif
+#if defined(RTC_SR_WUTF)
+	wut_was_active = LL_RTC_IsActiveFlag_WUT(RTC) != 0U;
+	if (wut_was_active) {
+		LL_RTC_ClearFlag_WUT(RTC);
+	}
+#endif
+
+	LL_RTC_EnableWriteProtection(RTC);
+
+	LL_PWR_ClearFlag_SB();
+	LL_PWR_ClearFlag_WU();
+
+	LOG_INF("RTC/PWR wake flags cleared (%s): alra=%d wut=%d",
+		reason,
+		alra_was_active ? 1 : 0,
+		wut_was_active ? 1 : 0);
+}
+#else
+static void rtc_clear_shutdown_wakeup_flags(const char *reason)
+{
+	ARG_UNUSED(reason);
+}
+#endif
+
 #if defined(CONFIG_RTC_ALARM)
 static void rtc_alarm_cb(const struct device *dev, uint16_t id, void *user_data)
 {
@@ -560,6 +603,8 @@ int task_rtc_set_alarm_in_seconds(uint32_t seconds_from_now)
 		return seed_ret;
 	}
 
+	rtc_clear_shutdown_wakeup_flags("before alarm re-arm");
+
 	struct rtc_time now_tm;
 	memset(&now_tm, 0, sizeof(now_tm));
 	ret = rtc_get_time(rtc_dev, &now_tm);
@@ -655,12 +700,12 @@ int task_rtc_set_from_gps(void)
 	return task_rtc_get_time(&validated_tm);
 }
 
-void task_rtc_prepare_shutdown_wakeup_route(void)
+int task_rtc_prepare_shutdown_wakeup_route(void)
 {
 #if defined(CONFIG_SOC_SERIES_STM32U5X)
 	if (!device_is_ready(rtc_dev)) {
 		LOG_WRN("RTC wake route skipped: RTC device not ready");
-		return;
+		return -ENODEV;
 	}
 
 	uint32_t cr = RTC->CR;
@@ -668,16 +713,19 @@ void task_rtc_prepare_shutdown_wakeup_route(void)
 
 	if (!alarm_a_enabled) {
 		LOG_WRN("RTC wake route skipped: AlarmA internal wakeup not enabled");
-		return;
+		return -ENOTSUP;
 	}
 
+	rtc_clear_shutdown_wakeup_flags("before shutdown");
 	LL_PWR_EnableWakeUpPin(LL_PWR_WAKEUP_PIN7);
 	LL_PWR_SetWakeUpPinSignal3Selection(LL_PWR_WAKEUP_PIN7);
 	LL_PWR_ClearFlag_SB();
 	LL_PWR_ClearFlag_WU();
 
 	LOG_INF("RTC wake route configured: WKUP7 <- signal3 (RTC AlarmA)");
+	return 0;
 #else
 	LOG_INF("RTC wake route prep is not required on this SoC series");
+	return 0;
 #endif
 }

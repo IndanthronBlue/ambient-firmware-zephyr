@@ -80,6 +80,7 @@ endif()
 
 target_sources(app PRIVATE
     src/main.c
+    src/app_deep_sleep.c
     src/app_state.c
     src/dfu_task.c
     src/sensor_task.c

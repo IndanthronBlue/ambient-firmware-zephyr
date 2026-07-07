@@ -6,7 +6,6 @@
 #include <zephyr/pm/policy.h>
 #include <zephyr/pm/state.h>
 #include <zephyr/storage/flash_map.h>
-#include <zephyr/sys/poweroff.h>
 #include <zephyr/drivers/hwinfo.h>
 
 #include "tasks.h"
@@ -16,9 +15,6 @@
 LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 
 #define APP_BOOT_COLD_POWERCYCLE_MS 1000U
-#ifndef APP_DEEP_SLEEP_WAKE_SEC
-#define APP_DEEP_SLEEP_WAKE_SEC     CONFIG_APP_DEEP_SLEEP_WAKE_SEC
-#endif
 #define APP_BOOT_GPS_SYNC_TIMEOUT_MS (3U * 60U * 1000U)
 #define APP_BOOT_GPS_RETRY_DELAY_MS  5000U
 #define APP_BOOT_DEBUG_WAIT_SLICE_MS 1000U
@@ -123,34 +119,6 @@ static void log_boot_self_check(void)
 	}
 }
 
-static void enter_deep_sleep_or_simulate(void)
-{
-	int alarm_ret = task_rtc_set_alarm_in_seconds(APP_DEEP_SLEEP_WAKE_SEC);
-	LOG_INF("[PWR] low-bat recovery RTC alarm ret=%d", alarm_ret);
-	if (alarm_ret < 0) {
-		LOG_ERR("[PWR] low-bat recovery abort: rtc alarm setup failed, skip sys_poweroff");
-		return;
-	}
-
-	if (APP_DEEP_SLEEP_ENABLED && !APP_DEEP_SLEEP_SIMULATE_ENABLED) {
-		LOG_INF("[PWR] Entering deep sleep by sys_poweroff() -> STM32U5 shutdown");
-		int prep_ret = power_ctrl_prepare_deep_sleep_all();
-		if (prep_ret < 0) {
-			LOG_ERR("[PWR] low-bat recovery abort: hardware prepare failed: %d, skip sys_poweroff",
-				prep_ret);
-			return;
-		}
-		task_rtc_prepare_shutdown_wakeup_route();
-		k_msleep(200);
-		sys_poweroff();
-		return;
-	}
-
-	LOG_WRN("[PWR] Deep sleep simulate enabled; sleeping %u sec",
-		(unsigned int)APP_DEEP_SLEEP_WAKE_SEC);
-	k_sleep(K_SECONDS(APP_DEEP_SLEEP_WAKE_SEC));
-}
-
 static bool is_gps_time_legal(void)
 {
 	uint32_t now_epoch = 0U;
@@ -217,7 +185,7 @@ int main(void)
 	// (void)task_rtc_init();
 
 	// // 直接进入休眠，不进入正常的active运行态，来验证RTC唤醒和低电压唤醒功能
-	// enter_deep_sleep_or_simulate();
+	// (void)app_deep_sleep_enter(CONFIG_APP_DEEP_SLEEP_WAKE_SEC, "debug_direct_entry");
 
 	app_pm_boot_guard_lock();
 
@@ -288,7 +256,11 @@ int main(void)
 		LOG_INF("[BOOT] battery after wake = %d mV", (int)batt_mv);
 		if (batt_mv < APP_LOW_BATTERY_MV) {
 			LOG_WRN("[BOOT] battery still low after wake, re-enter shutdown");
-			enter_deep_sleep_or_simulate();
+			int deep_sleep_ret = app_deep_sleep_enter(CONFIG_APP_DEEP_SLEEP_WAKE_SEC,
+				"boot_low_battery_rearm");
+			if (deep_sleep_ret < 0) {
+				LOG_ERR("[BOOT] low-battery deep sleep entry failed: %d", deep_sleep_ret);
+			}
 			return 0;
 		}
 	}

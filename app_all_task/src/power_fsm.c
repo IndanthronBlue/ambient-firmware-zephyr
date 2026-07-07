@@ -3,7 +3,6 @@
 #include <zephyr/pm/pm.h>
 #include <zephyr/pm/state.h>
 #include <zephyr/sys/atomic.h>
-#include <zephyr/sys/poweroff.h>
 
 #include "tasks.h"
 #include "app_feature_flags.h"
@@ -738,42 +737,21 @@ static void power_fsm_tick_deep_sleep(uint32_t now)
 	ARG_UNUSED(now);
 
 	if (!fsm.deep_sleep_prepared) {
-		int alarm_ret;
-		int prep_ret;
-
 		fsm.deep_sleep_prepared = true;
 
 		uint32_t wake_period_ms = (fsm.deep_sleep_wakeup_period_ms != 0U) ?
 			fsm.deep_sleep_wakeup_period_ms : DEEP_SLEEP_WAKE_PERIOD_MS;
-		alarm_ret = task_rtc_set_alarm_in_seconds(wake_period_ms / 1000U);
-		if (alarm_ret < 0) {
-			LOG_ERR("[PWR] deep_sleep abort: rtc alarm setup failed: %d", alarm_ret);
-			LOG_ERR("[PWR] deep_sleep abort: keep system running, skip sys_poweroff");
-			fsm.deep_sleep_prepared = false;
-			power_fsm_enter(POWER_STATE_SUSPEND, "deep_sleep_alarm_failed");
-			return;
-		}
-		LOG_INF("[PWR] deep_sleep rtc_alarm ret=%d", alarm_ret);
+		uint32_t wake_sec = (wake_period_ms + 999U) / 1000U;
 
-		prep_ret = power_ctrl_prepare_deep_sleep_all();
-		LOG_INF("[PWR] deep_sleep_prepare ret=%d", prep_ret);
-		if (prep_ret < 0) {
-			LOG_ERR("[PWR] deep_sleep abort: hardware prepare failed: %d", prep_ret);
-			LOG_ERR("[PWR] deep_sleep abort: keep system running, skip sys_poweroff");
-			fsm.deep_sleep_prepared = false;
-			power_fsm_enter(POWER_STATE_SUSPEND, "deep_sleep_prepare_failed");
-			return;
-		}
-
-		LOG_WRN("[PWR] deep sleep path entering sys_poweroff in %u ms wake window",
+		LOG_WRN("[PWR] deep sleep path entering unified shutdown in %u ms wake window",
 			(unsigned int)wake_period_ms);
-		LOG_WRN("[PWR] deep sleep final state: alarm armed, rails prepared");
-		k_msleep((wake_period_ms <= 60000U) ? 200U : 5000U);
 
-		if (APP_DEEP_SLEEP_ENABLED && !APP_DEEP_SLEEP_SIMULATE_ENABLED) {
-			task_rtc_prepare_shutdown_wakeup_route();
-			k_msleep(200);
-			sys_poweroff();
+		int deep_sleep_ret = app_deep_sleep_enter(wake_sec, "power_fsm");
+		if (deep_sleep_ret < 0) {
+			LOG_ERR("[PWR] deep_sleep abort: entry failed: %d", deep_sleep_ret);
+			LOG_ERR("[PWR] deep_sleep abort: keep system running, skip sys_poweroff");
+			fsm.deep_sleep_prepared = false;
+			power_fsm_enter(POWER_STATE_SUSPEND, "deep_sleep_entry_failed");
 			return;
 		}
 	}
