@@ -4,6 +4,30 @@ source "Kconfig.zephyr"
 
 menu "app_all_task feature switches"
 
+config APP_FW_VERSION_MAJOR
+	int "Application firmware version major"
+	default 0
+	range 0 65535
+	help
+	  Major version printed by the application at boot and carried in
+	  app_state telemetry.
+
+config APP_FW_VERSION_MINOR
+	int "Application firmware version minor"
+	default 0
+	range 0 65535
+	help
+	  Minor version printed by the application at boot and carried in
+	  app_state telemetry.
+
+config APP_FW_VERSION_PATCH
+	int "Application firmware version patch"
+	default 0
+	range 0 65535
+	help
+	  Patch version printed by the application at boot and carried in
+	  app_state telemetry.
+
 config APP_LOW_POWER_FSM
 	bool "Enable low-power FSM framework"
 	default n

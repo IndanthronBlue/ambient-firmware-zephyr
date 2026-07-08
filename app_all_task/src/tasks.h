@@ -10,9 +10,9 @@
 #include <zephyr/drivers/rtc.h>
 #include "power_fsm.h"
 
-#define APP_FW_VERSION_MAJOR 1U
-#define APP_FW_VERSION_MINOR 0U
-#define APP_FW_VERSION_PATCH 3U
+#define APP_FW_VERSION_MAJOR CONFIG_APP_FW_VERSION_MAJOR
+#define APP_FW_VERSION_MINOR CONFIG_APP_FW_VERSION_MINOR
+#define APP_FW_VERSION_PATCH CONFIG_APP_FW_VERSION_PATCH
 
 /* Unified low-battery protection threshold used by FSM and INA worker. */
 #define APP_LOW_BATTERY_MV 3500
@@ -275,6 +275,7 @@ void task_watchdog_note_long_op_start(const char *op_name, uint32_t timeout_ms);
 void task_watchdog_note_long_op_end(void);
 void task_system_periodic_reboot_check(void);
 
+int app_deep_sleep_enter(uint32_t wake_sec, const char *reason);
 
 int task_comm_init(void);
 typedef enum {
@@ -296,7 +297,7 @@ int task_rtc_get_epoch_local(uint32_t *local_epoch);
 bool task_rtc_time_is_real(const struct rtc_time *tm);
 int task_rtc_set_alarm_in_seconds(uint32_t seconds_from_now);
 int task_rtc_set_alarm_at_epoch(uint32_t epoch_local);
-void task_rtc_prepare_shutdown_wakeup_route(void);
+int task_rtc_prepare_shutdown_wakeup_route(void);
 
 /* ========== Low-power preparation hooks ========== */
 int task_storage_prepare_sleep(void);
