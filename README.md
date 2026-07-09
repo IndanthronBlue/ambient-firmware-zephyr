@@ -72,7 +72,7 @@ Main features:
 
 After power-on, the device automatically:
 
-1. Initializes RTC, SD card, microphone, sensors, LoRaWAN, watchdog, and the low-power state machine.
+1. Initializes RTC, microphone, sensors, LoRaWAN, watchdog, and the low-power state machine; SD mount/DFU checks are deferred until the watchdog is active.
 2. Periodically enters an ACTIVE window to capture audio and run bird detection/classification.
 3. Stores audio to the SD card as `.wav`.
 4. Sends one summary payload over LoRaWAN when the uplink interval is reached.
@@ -99,19 +99,26 @@ application Kconfig definitions are in [app_all_task/Kconfig](app_all_task/Kconf
 
 | Parameter | Purpose | Current value | Recommended value | Location |
 | --- | --- | --- | --- | --- |
+| `CONFIG_APP_FW_VERSION_MAJOR/MINOR/PATCH` | Firmware version printed at boot and carried in telemetry state. | `2.0.0` | Bump for releases. | `prj.conf`, `Kconfig`, `src/tasks.h` |
 | `CONFIG_APP_LOW_POWER_FSM` | Enable the low-power state machine. | `y` | Keep `y` for production. | `prj.conf` |
 | `CONFIG_APP_DEEP_SLEEP_ENABLE` | Allow real deep-sleep / power-off paths. | `y` | `y` for production; temporarily disable only for power debugging. | `prj.conf` |
 | `CONFIG_APP_RETENTION_ENABLE` | Enable retained state. | `y` | Keep `y` for production. | `prj.conf` |
 | `CONFIG_APP_DEEP_SLEEP_SIMULATE` | Simulate deep sleep without actual power-off. | `n` | `n` for production; `y` for bring-up. | `prj.conf` |
 | `CONFIG_APP_MICROPHONE_DEBUG_SKIP_GPS_LORA` | Skip GPS and LoRaWAN while debugging the microphone path. | `n` | `n` for normal operation; `y` for audio debugging. | `prj.conf` |
-| `CONFIG_APP_STATUS_LED` | Enable status LED event pulses. | `n` | `n` for low-power deployment; `y` for field debugging. | `prj.conf` |
+| `CONFIG_APP_LORAWAN_BOOT_UPLINK_DEBUG` | Send one diagnostic uplink immediately after startup join. | Kconfig default `n` | Keep `n` except during radio bring-up. | `Kconfig`, `src/main.c` |
+| `CONFIG_APP_LORAWAN_BOOT_REPEAT_UPLINK_DEBUG` | Send a second startup debug uplink after a delay. | Kconfig default `n` | Keep `n` except during radio bring-up. | `Kconfig`, `src/main.c` |
+| `CONFIG_APP_LORAWAN_BOOT_REPEAT_DELAY_MS` | Delay before the second startup debug uplink. | Kconfig default `60000` ms | Only relevant when repeat boot uplink debug is enabled. | `Kconfig` |
+| `CONFIG_APP_STATUS_LED` | Enable status LED event pulses. | `y` | Set `n` for lowest-power production builds if LED pulses are not needed. | `prj.conf` |
 | `CONFIG_APP_INFERENCE_LABEL_CNT` | Number of classifier labels. | `11` | Must match the number of non-empty lines in the label file. | `prj.conf`, `Kconfig` |
 | `CONFIG_APP_INFERENCE_LABELS_FILE` | Classifier label file. | `config/inference_labels.txt` | Update together with model labels. | `prj.conf`, `app_all_task/config` |
 | `CONFIG_APP_INFERENCE_USE_INT16_QUANT_MODEL` | Use the int16 quantized model interface. | `y` | Keep `y` for the current model. | `prj.conf` |
 | `CONFIG_APP_MIC_MICPGA_GAIN_DB` | ADC3101 analog microphone PGA gain applied to both channels. | `12` dB | Tune by recorded peak level; lower it if clipping appears. | `prj.conf`, `Kconfig` |
 | `CONFIG_APP_INFERENCE_DETECT_CONF_THRESH_PERCENT` | Detector confidence threshold. | Kconfig default `50` | Tune based on false positives / false negatives. | `Kconfig` |
 | `CONFIG_APP_LORAWAN_UPLINK_INTERVAL_MS` | LoRaWAN uplink interval. | `1800000` ms | Default is 30 minutes; tune by power budget and network capacity. | `prj.conf` |
+| `CONFIG_APP_SUSPEND_TO_ACTIVE_PERIOD_MS` | SUSPEND-to-ACTIVE periodic wake interval. | `30000` ms | Current test value is 30 seconds; increase for long-term deployment as needed. | `prj.conf`, `Kconfig`, `src/power_fsm.c` |
 | `CONFIG_APP_GPS_UPLINK_WAIT_TIMEOUT_MS` | Time to wait for GPS before uplink. | `60000` ms | `30000~60000` ms is typical. | `prj.conf` |
+| `CONFIG_APP_DEEP_SLEEP_WAKE_SEC` | RTC wake interval used by boot low-battery recovery and the low-power FSM's default DEEP_SLEEP path. | `10800` s | Current default is 3 hours; tune by battery recovery policy. | `prj.conf`, `Kconfig`, `src/main.c`, `src/power_fsm.c` |
+| `CONFIG_APP_LORAWAN_APP_KEY_HEX` | LoRaWAN OTAA AppKey as 32 hex characters; parsed into the runtime AppKey/NwkKey buffer. | Set in `prj.conf` | Keep production keys in a private, untracked build config. | `prj.conf`, `Kconfig`, `src/lorawan_task.c` |
 | `CONFIG_APP_WAKEUP_SRC_BUTTON` | Button wake source. | `y` | Keep `y` if manual wake is needed. | `prj.conf` |
 | `CONFIG_APP_WAKEUP_SRC_PERIODIC` | Periodic wake source. | `y` | Keep `y` for production. | `prj.conf` |
 | `CONFIG_APP_WAKEUP_SRC_COMM` | Communication-request wake source. | `y` | Keep `y` for production. | `prj.conf` |
@@ -120,22 +127,20 @@ application Kconfig definitions are in [app_all_task/Kconfig](app_all_task/Kconf
 | `CONFIG_APP_WAKEUP_SRC_LOW_BAT` | Low-battery protection trigger. | `y` | Keep `y` for production. | `prj.conf` |
 | `APP_LOW_BATTERY_MV` | Low-battery threshold. | `3500` mV | Tune according to battery and power policy. | `src/tasks.h` |
 | `APP_BOOT_GPS_SYNC_TIMEOUT_MS` | GPS time-sync wait during boot. | `180000` ms | Keep for outdoor deployment; shorten for debugging. | `src/main.c` |
-| `APP_DEEP_SLEEP_WAKE_SEC` | RTC wake period used when boot detects that the battery is still low and immediately powers down again. | `3600` s | If all low-battery recovery periods should match, align this with `DEEP_SLEEP_WAKE_PERIOD_MS`. | `src/main.c` |
 | `ACTIVE_BURST_MS` | ACTIVE window duration. | `10000` ms | Tune by capture window and power budget. | `src/power_fsm.c` |
-| `SUSPEND_TO_ACTIVE_PERIOD_MS` | SUSPEND-to-ACTIVE period. | `60000` ms | Current test value is 1 minute; increase for long-term deployment as needed. | `src/power_fsm.c` |
-| `DEEP_SLEEP_WAKE_PERIOD_MS` | Default RTC wake period when the low-power FSM enters DEEP_SLEEP. | `1800000` ms | Default is 30 minutes; runtime low-battery events use this value. | `src/power_fsm.c` |
+| `DEEP_SLEEP_WAKE_PERIOD_MS` | Derived default DEEP_SLEEP wake period used inside the FSM. | `CONFIG_APP_DEEP_SLEEP_WAKE_SEC * 1000` = `10800000` ms | Change `CONFIG_APP_DEEP_SLEEP_WAKE_SEC` first unless adding a special recovery path. | `src/power_fsm.c` |
+| `CODEC_ZERO_FAULT_SHUTDOWN_WAKE_MS` | Special short RTC wake after repeated codec zero-output faults. | `20000` ms | Keep short for codec recovery diagnostics. | `src/power_fsm.c` |
 | `MIC_SAMPLE_FREQUENCY` | Audio sample rate. | `16000` Hz | Keep 16 kHz for the current model. | `src/microphone_task.c` |
 | `STORAGE_WAV_SAMPLE_RATE` | WAV file sample rate. | `16000` Hz | Keep in sync with the microphone sample rate. | `src/storage_task.c` |
 | `LORAWAN_APP_PORT` | LoRaWAN uplink port. | `2` | Keep cloud decoder in sync. | `src/lorawan_task.c` |
 | `WATCHDOG_TIMEOUT_MS` | Hardware watchdog timeout. | `24000` ms | Do not shorten unless blocking paths are fully understood. | `src/system_task.c` |
 | `DFU_READ_CHUNK_SIZE` | SD DFU read chunk size. | `4096` B | Keep default. | `src/dfu_task.c` |
 
-`APP_DEEP_SLEEP_WAKE_SEC` and `DEEP_SLEEP_WAKE_PERIOD_MS` are used on different
-paths. The former is used by `main.c` when the boot-time low-battery check fails
-and the device immediately powers down again. The latter is the default period
-used by `power_fsm.c` after the system is running and enters DEEP_SLEEP. They can
-be different, but if the product policy requires one low-battery recovery period,
-adjust both values together.
+`CONFIG_APP_DEEP_SLEEP_WAKE_SEC` is the shared product setting for boot-time
+low-battery recovery and the power FSM's default DEEP_SLEEP path. `power_fsm.c`
+derives `DEEP_SLEEP_WAKE_PERIOD_MS` from that Kconfig value. The main runtime
+exception is the codec zero-output recovery path, which intentionally uses the
+short `CODEC_ZERO_FAULT_SHUTDOWN_WAKE_MS` wake interval.
 
 Classifier labels are stored in
 [app_all_task/config/inference_labels.txt](app_all_task/config/inference_labels.txt).
@@ -150,17 +155,18 @@ parameters:
 | Parameter | Source | Where to configure it |
 | --- | --- | --- |
 | `JoinEUI` | Assigned by the LoRaWAN network/application server. It may also be called `AppEUI`. | `join_eui[]` in [app_all_task/src/lorawan_task.c](app_all_task/src/lorawan_task.c). |
-| `AppKey` / `NwkKey` | 16-byte key generated by, or created for, the LoRaWAN server. The current code uses the same `app_key` as `nwk_key`. | `app_key[]` in [app_all_task/src/lorawan_task.c](app_all_task/src/lorawan_task.c). |
+| `AppKey` / `NwkKey` | 16-byte key generated by, or created for, the LoRaWAN server. The current code parses `CONFIG_APP_LORAWAN_APP_KEY_HEX` into `app_key[]` and uses the same buffer as `nwk_key`. | `CONFIG_APP_LORAWAN_APP_KEY_HEX` in [app_all_task/prj.conf](app_all_task/prj.conf), or preferably a private build config for production keys. |
 | `DevEUI` | Device-unique ID. The firmware first loads it from `/dev.txt` on the SD card; if missing, it derives one from the MCU hardware ID and writes it back to `/dev.txt`. | Enter the same DevEUI when creating the device on the server. |
 
 Recommended flow:
 
 1. Create an application on the LoRaWAN server and obtain or set `JoinEUI` and `AppKey`.
-2. Fill `JoinEUI` and `AppKey` in `lorawan_task.c` using MSB-first byte order.
-3. Flash the firmware and open the serial log.
-4. On first boot, read the `Generated DevEUI`, `Loaded DevEUI`, or `Fallback DevEUI` log line.
-5. Enter that DevEUI in the server device profile / end-device page.
-6. If the SD card already contains `/dev.txt`, the same device will continue using that DevEUI.
+2. Fill `JoinEUI` in `lorawan_task.c` using MSB-first byte order.
+3. Set `CONFIG_APP_LORAWAN_APP_KEY_HEX` to the 32-character MSB-first AppKey hex string.
+4. Flash the firmware and open the serial log.
+5. On first boot, read the `Generated DevEUI`, `Loaded DevEUI`, or `Fallback DevEUI` log line.
+6. Enter that DevEUI in the server device profile / end-device page.
+7. If the SD card already contains `/dev.txt`, the same device will continue using that DevEUI.
 
 Example: if the server shows `JoinEUI = 0011223344556677`, configure it as:
 
@@ -170,8 +176,16 @@ static uint8_t join_eui[] = {
 };
 ```
 
+Example AppKey configuration:
+
+```conf
+CONFIG_APP_LORAWAN_APP_KEY_HEX="00112233445566778899AABBCCDDEEFF"
+```
+
 Do not commit real production `AppKey`, `NwkKey`, or other secret keys to a
-public repository.
+public repository. For production, move `CONFIG_APP_LORAWAN_APP_KEY_HEX` to a
+private, untracked build configuration instead of keeping it in public
+`prj.conf`.
 
 MCUboot signature configuration is in
 [app_all_task/mcuboot_bird_ec256.conf](app_all_task/mcuboot_bird_ec256.conf).
@@ -368,8 +382,9 @@ git/ambient-firmware-zephyr/app_all_task/dts/bindings/retained_mem/bird,retained
 ```
 
 It is compiled by [app_all_task/CMakeLists.txt](app_all_task/CMakeLists.txt)
-only when Devicetree enables a `bird,retained-bbram` node. This means L4
-retention works without patching Zephyr's `drivers/retained_mem/CMakeLists.txt`.
+only when Devicetree enables a `bird,retained-bbram` node and the Zephyr tree
+does not already provide `drivers/retained_mem/retained_mem_bbram.c`. This means
+L4 retention works without patching Zephyr's `drivers/retained_mem/CMakeLists.txt`.
 An L4 build can still print Zephyr's
 `No SOURCES given to Zephyr library: drivers__retained_mem` warning; that is
 harmless here because the `bird,retained-bbram` backend is built as application
