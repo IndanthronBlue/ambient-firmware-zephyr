@@ -42,7 +42,6 @@ static const struct device *const i2s_dev = DEVICE_DT_GET(SAI1B_NODE);
 #define MIC_BLOCK_COUNT         6
 #define MIC_IO_TIMEOUT_MS       200
 #define MIC_RING_BLOCK_COUNT    30
-#define MIC_STARTUP_DISCARD_BLOCKS 8U
 #define MIC_PIPELINE_WAIT_MS        3000
 #define MIC_INFERENCE_WAIT_TIMEOUT_MS 10000U
 
@@ -53,7 +52,6 @@ K_MEM_SLAB_DEFINE_STATIC(mic_rx_slab, MIC_CAPTURE_BLOCK_SIZE, MIC_BLOCK_COUNT, 4
 /* Internal state */
 static bool mic_initialized = false;
 static bool mic_sleep_prepared = false;
-static bool mic_startup_discard_pending = false;
 
 
 /* Ring-RAM pipeline state: one producer (capture) and two consumers (inference/sd). */
@@ -516,7 +514,6 @@ static int task_microphone_init_locked(void)
 					mic_initialized = false;
 					return ret;
 				}
-				mic_startup_discard_pending = true;
 				mic_sleep_prepared = false;
 				k_msleep(ADC3101_POST_SETUP_SETTLE_MS);
 			}
@@ -532,8 +529,6 @@ static int task_microphone_init_locked(void)
 	if (ret < 0) {
 		return ret;
 	}
-	mic_startup_discard_pending = true;
-
 	ret = mic_configure_i2s_rx();
 	if (ret < 0) {
 		return ret;
@@ -656,8 +651,6 @@ bool task_microphone_capture_once(void)
 	bool rx_restarted_once = false;
 	bool rx_full_recovered_once = false;
 	bool audio_seen = false;
-	uint8_t startup_discard_blocks =
-		mic_startup_discard_pending ? MIC_STARTUP_DISCARD_BLOCKS : 0U;
 	int blocks_written = 0;
 	mic_pipeline_reset_state();
 	uint32_t capture_start_ms = k_uptime_get_32();
@@ -801,7 +794,9 @@ bool task_microphone_capture_once(void)
 			continue;
 		}
 
-		/* Quick sanity check: report block peak to detect all-zero capture early. */
+		/* Discard only genuinely all-zero leading blocks. The first non-zero
+		 * block is valid capture data and must immediately enter SD/inference.
+		 */
 		const int16_t *s16 = (const int16_t *)rx_mem_block;
 		size_t s16_count = sz / sizeof(int16_t);
 		uint32_t peak = 0U;
@@ -847,25 +842,13 @@ bool task_microphone_capture_once(void)
 			}
 			} else {
 				if (!audio_seen) {
-					LOG_INF("RX audio probe OK: first non-zero block peak=%u after %u leading zero block(s)",
+					LOG_INF("RX audio probe OK: first non-zero block accepted immediately, peak=%u after %u leading zero block(s)",
 						(unsigned int)peak,
-					(unsigned int)leading_zero_blocks);
-				task_status_led_event(STATUS_LED_CODEC_RECORDING_OK);
-			}
-			audio_seen = true;
-				LOG_DBG("RX block peak=%u", (unsigned)peak);
-			}
-
-			if (startup_discard_blocks > 0U) {
-				startup_discard_blocks--;
-				if (startup_discard_blocks == 0U) {
-					mic_startup_discard_pending = false;
-					LOG_INF("RX startup discard complete (%u block(s), ~%u ms)",
-						(unsigned int)MIC_STARTUP_DISCARD_BLOCKS,
-						(unsigned int)(MIC_STARTUP_DISCARD_BLOCKS * 100U));
+						(unsigned int)leading_zero_blocks);
+					task_status_led_event(STATUS_LED_CODEC_RECORDING_OK);
 				}
-				k_mem_slab_free(&mic_rx_slab, rx_mem_block);
-				continue;
+				audio_seen = true;
+				LOG_DBG("RX block peak=%u", (unsigned)peak);
 			}
 
 			k_mutex_lock(&mic_ring_lock, K_FOREVER);
