@@ -198,6 +198,15 @@ config APP_SD_SUSPEND_RETRY_MAX_MS
 	  Maximum delay between bounded suspend preparation retries when storage
 	  cannot yet finish an outstanding SD operation.
 
+config APP_SD_FUSE_BACKOFF_SEC
+	int "SD fuse backoff duration in seconds"
+	default 300
+	range 1 86400
+	help
+	  Time to suppress SD mount and file access after the SD failure fuse is
+	  activated. The production configuration may shorten this interval while
+	  preserving the same failure threshold and retained-state behavior.
+
 config APP_LORAWAN_APP_KEY_HEX
 	string "LoRaWAN OTAA AppKey in hex"
 	default ""

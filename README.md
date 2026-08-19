@@ -56,6 +56,63 @@ Main features:
 - ACTIVE / SUSPEND / DEEP_SLEEP low-power state machine.
 - Low-battery protection, watchdog, and retained state.
 
+## Current Production Release: 2.1.0
+
+The current STM32U595R production firmware is version `2.1.0`. Its release
+profile is:
+
+| Setting | Production value |
+| --- | --- |
+| LoRaWAN uplink interval | `1800000` ms, or 30 minutes |
+| LoRaWAN uplink type | Unconfirmed |
+| Default deep-sleep wake interval | `10800` s, or 3 hours |
+| SD fuse activation threshold | 3 consecutive fast SD failures |
+| SD fuse backoff | `60` s |
+| Flash driver debug logging | Disabled in the production build |
+| MCUboot image version | `2.1.0+0` |
+
+### LoRaWAN startup and DevNonce policy
+
+- A normal startup or periodic wake restores and reuses the LoRaMAC OTAA
+  session saved by Zephyr's LoRaWAN Settings backend.
+- A hardware reset reported through the MCU `RESET_PIN` reset cause, including
+  the board reset button, blocks use of the restored session and requires a
+  fresh OTAA Join before application uplinks resume.
+- Before the first Join attempt after that hardware reset, the firmware reads
+  the restored LoRaMAC `DevNonce`, advances it once by a hardware-random value
+  from `32` through `63`, and then lets LoRaMAC generate the next JoinRequest.
+- Additional Join retries during the same boot do not apply another random
+  jump. LoRaMAC performs its normal one-step DevNonce progression for retries.
+- The firmware does not delete LoRaWAN Settings records and does not manually
+  write LoRaMAC NVM. Join results and counters are persisted only through the
+  original LoRaMAC automatic NVM callback path.
+- STM32 hardware RNG supplies the random jump through Zephyr CSPRNG. If CSPRNG
+  fails, the firmware uses the minimum forward jump of `32`; it rejects the
+  Join instead of allowing the 16-bit DevNonce to wrap.
+
+The expected diagnostic line for a hardware-reset Join is similar to:
+
+```text
+LoRaWAN pin-reset DevNonce jump: stored=7 jump=43 pre_join=50 next_request=51
+```
+
+### SD failure fuse policy
+
+The SD fuse prevents repeated mount and file operations after a cluster of
+fast SD failures. Three consecutive fast failures activate the fuse. Version
+`2.1.0` configures `CONFIG_APP_SD_FUSE_BACKOFF_SEC=60`, so new fuse activations
+suppress SD access for one minute. The delay is fixed and does not increase
+with the retained strike count. A successful SD mount or write clears the
+failure streak and retained fuse state.
+
+The fuse deadline is retained across reset. If a device upgrades while an old
+firmware fuse deadline is already active, that stored deadline is allowed to
+expire normally; subsequent fuse activations use the new 60-second setting.
+
+For radio testing, use the same feature set with only
+`CONFIG_APP_LORAWAN_UPLINK_INTERVAL_MS=60000`. Do not deploy the one-minute
+uplink profile as the normal production configuration.
+
 ## Repository Structure
 
 | Path | Description |
@@ -99,7 +156,7 @@ application Kconfig definitions are in [app_all_task/Kconfig](app_all_task/Kconf
 
 | Parameter | Purpose | Current value | Recommended value | Location |
 | --- | --- | --- | --- | --- |
-| `CONFIG_APP_FW_VERSION_MAJOR/MINOR/PATCH` | Firmware version printed at boot and carried in telemetry state. | `2.0.0` | Bump for releases. | `prj.conf`, `Kconfig`, `src/tasks.h` |
+| `CONFIG_APP_FW_VERSION_MAJOR/MINOR/PATCH` | Firmware version printed at boot and carried in telemetry state. | `2.1.0` | Bump for releases. | `prj.conf`, `Kconfig`, `src/tasks.h` |
 | `CONFIG_APP_LOW_POWER_FSM` | Enable the low-power state machine. | `y` | Keep `y` for production. | `prj.conf` |
 | `CONFIG_APP_DEEP_SLEEP_ENABLE` | Allow real deep-sleep / power-off paths. | `y` | `y` for production; temporarily disable only for power debugging. | `prj.conf` |
 | `CONFIG_APP_RETENTION_ENABLE` | Enable retained state. | `y` | Keep `y` for production. | `prj.conf` |
@@ -116,6 +173,7 @@ application Kconfig definitions are in [app_all_task/Kconfig](app_all_task/Kconf
 | `CONFIG_APP_INFERENCE_DETECT_CONF_THRESH_PERCENT` | Detector confidence threshold. | Kconfig default `50` | Tune based on false positives / false negatives. | `Kconfig` |
 | `CONFIG_APP_LORAWAN_UPLINK_INTERVAL_MS` | LoRaWAN uplink interval. | `1800000` ms | Default is 30 minutes; tune by power budget and network capacity. | `prj.conf` |
 | `CONFIG_APP_SUSPEND_TO_ACTIVE_PERIOD_MS` | SUSPEND-to-ACTIVE periodic wake interval. | `30000` ms | Current test value is 30 seconds; increase for long-term deployment as needed. | `prj.conf`, `Kconfig`, `src/power_fsm.c` |
+| `CONFIG_APP_SD_FUSE_BACKOFF_SEC` | Time to suppress SD mount and file access after the SD failure fuse activates. | `60` s | Production value is 1 minute; increase only if repeated failing-card access must be suppressed longer. | `prj.conf`, `Kconfig`, `src/storage_task.c` |
 | `CONFIG_APP_GPS_UPLINK_WAIT_TIMEOUT_MS` | Time to wait for GPS before uplink. | `60000` ms | `30000~60000` ms is typical. | `prj.conf` |
 | `CONFIG_APP_DEEP_SLEEP_WAKE_SEC` | RTC wake interval used by boot low-battery recovery and the low-power FSM's default DEEP_SLEEP path. | `10800` s | Current default is 3 hours; tune by battery recovery policy. | `prj.conf`, `Kconfig`, `src/main.c`, `src/power_fsm.c` |
 | `CONFIG_APP_LORAWAN_APP_KEY_HEX` | LoRaWAN OTAA AppKey as 32 hex characters; parsed into the runtime AppKey/NwkKey buffer. | Set in `prj.conf` | Keep production keys in a private, untracked build config. | `prj.conf`, `Kconfig`, `src/lorawan_task.c` |
@@ -628,6 +686,7 @@ Key configuration:
 - `SAI1_B` is used for ADC3101 audio capture, with default/sleep pinctrl states.
 - `SPI3` connects both LoRa SX1262 and the SPI SD card.
 - `I2C1` connects GPS/BME280; `I2C2` connects ADC3101/INA3221-related peripherals.
+- STM32U595R hardware RNG is enabled for the pin-reset DevNonce forward jump.
 - `v_periph`, GPS power GPIOs, and SPI/SD-related GPIOs are managed by `power_ctrl.c`.
 - Retained memory stores boot, low-battery, SD fuse, and related state. U5 uses backup SRAM; L4 uses the BBRAM binding.
 - RTC and LPTIM are used for low-power waiting, alarm wakeup, and system tick.

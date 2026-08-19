@@ -7,6 +7,7 @@
 #include <zephyr/device.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/lorawan/lorawan.h>
+#include <zephyr/random/random.h>
 #include <zephyr/sys/byteorder.h>
 #include <stm32_ll_utils.h>
 #include <LoRaMac.h>
@@ -59,16 +60,22 @@ static uint8_t app_key[16];
 #define LORAWAN_CONFIRMED_FAIL_LIMIT    2U
 #define STM32_UID_WORD_COUNT            3U
 #define STM32_UID_BYTES_LEN             (STM32_UID_WORD_COUNT * sizeof(uint32_t))
+#define LORAWAN_PIN_RESET_DEVNONCE_JUMP_MIN 32U
+#define LORAWAN_PIN_RESET_DEVNONCE_JUMP_MAX 63U
 
 BUILD_ASSERT(TX_PAYLOAD_BUCKET_BYTES <= UINT8_MAX,
 	     "LoRa bucket count must fit in one payload byte");
 BUILD_ASSERT(TX_PAYLOAD_LENGTH <= UINT8_MAX,
 	     "LoRa payload length must fit in one payload byte");
+BUILD_ASSERT(LORAWAN_PIN_RESET_DEVNONCE_JUMP_MAX >=
+	     LORAWAN_PIN_RESET_DEVNONCE_JUMP_MIN,
+	     "Pin-reset DevNonce jump range is invalid");
 
 static bool lorawan_stack_started;
 static bool lorawan_session_joined;
 /* A pin reset requires a new OTAA session before any application uplink. */
 static bool fresh_join_required;
+static bool pin_reset_devnonce_jump_pending;
 static bool lorawan_mac_initialized;
 static bool downlink_cb_registered;
 static bool dev_eui_initialized;
@@ -568,6 +575,68 @@ static void lorawan_log_next_dev_nonce(void)
 #endif
 }
 
+static int lorawan_apply_pin_reset_devnonce_jump(void)
+{
+#if IS_ENABLED(CONFIG_LORAWAN_NVM_SETTINGS)
+	MibRequestConfirm_t mib_req = { 0 };
+	uint32_t random_value = 0U;
+	uint32_t available_jump;
+	uint32_t jump_max;
+	uint32_t jump;
+	uint16_t stored_devnonce;
+	int ret;
+
+	mib_req.Type = MIB_NVM_CTXS;
+	if ((LoRaMacMibGetRequestConfirm(&mib_req) != LORAMAC_STATUS_OK) ||
+	    (mib_req.Param.Contexts == NULL)) {
+		LOG_ERR("LoRaWAN pin-reset DevNonce jump failed: NVM context unavailable");
+		return -EIO;
+	}
+
+	stored_devnonce = mib_req.Param.Contexts->Crypto.DevNonce;
+	if (stored_devnonce >= UINT16_MAX - 1U) {
+		LOG_ERR("LoRaWAN DevNonce exhausted: stored=%u",
+			(unsigned int)stored_devnonce);
+		return -EOVERFLOW;
+	}
+	available_jump = (uint32_t)UINT16_MAX - 1U - stored_devnonce;
+	if (available_jump < LORAWAN_PIN_RESET_DEVNONCE_JUMP_MIN) {
+		LOG_ERR("LoRaWAN DevNonce cannot jump safely: stored=%u remaining=%u",
+			(unsigned int)stored_devnonce,
+			(unsigned int)available_jump);
+		return -EOVERFLOW;
+	}
+
+	jump_max = MIN((uint32_t)LORAWAN_PIN_RESET_DEVNONCE_JUMP_MAX,
+		       available_jump);
+	ret = sys_csrand_get(&random_value, sizeof(random_value));
+	if (ret < 0) {
+		LOG_WRN("LoRaWAN CSPRNG unavailable for pin-reset DevNonce jump (%d); using minimum jump",
+			ret);
+		jump = LORAWAN_PIN_RESET_DEVNONCE_JUMP_MIN;
+	} else {
+		jump = LORAWAN_PIN_RESET_DEVNONCE_JUMP_MIN +
+			(random_value % (jump_max -
+			 LORAWAN_PIN_RESET_DEVNONCE_JUMP_MIN + 1U));
+	}
+
+	mib_req.Param.Contexts->Crypto.DevNonce =
+		(uint16_t)(stored_devnonce + jump);
+	pin_reset_devnonce_jump_pending = false;
+
+	LOG_INF("LoRaWAN pin-reset DevNonce jump: stored=%u jump=%u pre_join=%u next_request=%u",
+		(unsigned int)stored_devnonce,
+		(unsigned int)jump,
+		(unsigned int)mib_req.Param.Contexts->Crypto.DevNonce,
+		(unsigned int)(mib_req.Param.Contexts->Crypto.DevNonce + 1U));
+	return 0;
+#else
+	LOG_WRN("LoRaWAN pin-reset DevNonce jump unavailable without Settings NVM");
+	pin_reset_devnonce_jump_pending = false;
+	return 0;
+#endif
+}
+
 static void lorawan_invalidate_session(const char *reason)
 {
 	lorawan_session_joined = false;
@@ -714,6 +783,14 @@ static int lorawan_attempt_join(void)
 	join_cfg.mode = LORAWAN_ACT_OTAA;
 	join_cfg.dev_eui = dev_eui;
 	join_cfg.otaa.join_eui = join_eui;
+
+	if (fresh_join_required && pin_reset_devnonce_jump_pending) {
+		ret = lorawan_apply_pin_reset_devnonce_jump();
+		if (ret < 0) {
+			app_state.lorawan_last_error = ret;
+			return ret;
+		}
+	}
 
 	ret = lorawan_init_app_key_once();
 	if (ret < 0) {
@@ -1149,6 +1226,7 @@ int task_lorawan_connect(bool force_fresh_join)
 
 	if (force_fresh_join) {
 		fresh_join_required = true;
+		pin_reset_devnonce_jump_pending = true;
 		lorawan_session_joined = false;
 		app_state.lorawan_joined = false;
 		LOG_INF("LoRaWAN pin reset requests fresh OTAA join");

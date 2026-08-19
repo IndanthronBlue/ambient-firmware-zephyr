@@ -72,7 +72,6 @@ static uint32_t storage_session_id = 0U;
 #define STORAGE_SD_UNMOUNT_LOCK_WAIT_MS 250U
 #define STORAGE_SD_UNMOUNT_OP_TIMEOUT_MS 5000U
 #define STORAGE_SD_FUSE_FAST_FAILURE_THRESHOLD 3U
-#define STORAGE_SD_FUSE_BACKOFF_SEC (5U * 60U)
 #define STORAGE_SD_FUSE_LOG_PERIOD_MS 60000U
 #define STORAGE_SD_RETAINED_OP_CODE 1U
 #define STORAGE_WAV_SAMPLE_RATE 16000U
@@ -180,7 +179,7 @@ static uint32_t storage_sd_fuse_backoff_sec(uint16_t strikes)
 {
 	ARG_UNUSED(strikes);
 
-	return STORAGE_SD_FUSE_BACKOFF_SEC;
+	return CONFIG_APP_SD_FUSE_BACKOFF_SEC;
 }
 
 static bool storage_sd_get_epoch(uint32_t *epoch)

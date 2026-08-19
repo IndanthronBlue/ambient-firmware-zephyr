@@ -63,6 +63,10 @@
 	status = "okay";
 };
 
+&rng {
+	status = "okay";
+};
+
 &zephyr_udc0 {
 	/* PA11/PA12 use the embedded full-speed PHY; avoid invalid HS CDC
 	 * descriptors.
