@@ -34,8 +34,21 @@ static struct fs_mount_t fatfs_mnt = {
 	.storage_dev = (void *)"SD"
 };
 
+#define STORAGE_SD_DISK_NAME "SD"
+#define STORAGE_SD_FAT_DRIVE "SD:"
+
+enum storage_sd_state {
+	STORAGE_SD_STATE_OFF = 0,
+	STORAGE_SD_STATE_MOUNTING,
+	STORAGE_SD_STATE_MOUNTED,
+	STORAGE_SD_STATE_UNMOUNTING,
+	STORAGE_SD_STATE_ERROR,
+};
+
 /* Initialization flag */
 static bool sd_initialized = false;
+static bool sd_fs_mounted;
+static enum storage_sd_state sd_state = STORAGE_SD_STATE_OFF;
 static struct fs_file_t pcm_file;
 static bool pcm_file_opened = false;
 static bool pcm_file_inited = false;
@@ -96,6 +109,10 @@ static void storage_pcm_close_worker_thread(void *a, void *b, void *c);
 static void storage_pcm_close_worker_start_once(void);
 static void storage_pcm_end_locked(void);
 static void storage_clear_sd_state(void);
+static int storage_sd_unmount_locked(const char *reason);
+static int storage_cleanup_failed_mount_locked(int mount_ret);
+static int storage_sd_mount_once_locked(void);
+static int storage_force_detach_locked(const char *reason);
 static void storage_note_sd_no_space(uint64_t free_bytes, const char *reason);
 
 void task_storage_set_session_id(uint32_t session_id)
@@ -107,6 +124,16 @@ bool task_storage_local_write_blocked(void)
 {
 	return (atomic_get(&storage_local_write_blocked) != 0) ||
 	       task_storage_sd_fuse_active();
+}
+
+int task_storage_fs_lock(void)
+{
+	return k_mutex_lock(&storage_fs_lock, K_FOREVER);
+}
+
+void task_storage_fs_unlock(void)
+{
+	k_mutex_unlock(&storage_fs_lock);
 }
 
 static void storage_pcm_close_worker_thread(void *a, void *b, void *c)
@@ -313,7 +340,7 @@ bool task_storage_sd_fuse_active(void)
 	    storage_time_reached32(k_uptime_get_32(),
 				   storage_sd_fuse_last_log_ms + STORAGE_SD_FUSE_LOG_PERIOD_MS)) {
 		storage_sd_fuse_last_log_ms = k_uptime_get_32();
-		LOG_WRN("SD fuse suppressing non-mount SD access; mount retries every ACTIVE (sdon=%u)",
+		LOG_WRN("SD fuse suppressing mount and file access until backoff expires (sdon=%u)",
 			(unsigned int)APP_SDON_FUSED);
 	}
 	k_mutex_unlock(&storage_sd_fuse_lock);
@@ -408,10 +435,129 @@ static void storage_clear_sd_state(void)
 	app_state.sd_free_mib = 0U;
 }
 
+static int storage_sd_unmount_locked(const char *reason)
+{
+	if (!sd_fs_mounted && !app_state.sd_mounted) {
+		storage_clear_sd_state();
+		sd_state = STORAGE_SD_STATE_OFF;
+		return 0;
+	}
+
+	if (pcm_file_opened) {
+		LOG_ERR("SD unmount refused while PCM file is open: %s",
+			reason != NULL ? reason : "unknown");
+		return -EBUSY;
+	}
+
+	sd_state = STORAGE_SD_STATE_UNMOUNTING;
+	task_watchdog_note_sd_op_start("sd_unmount", STORAGE_SD_UNMOUNT_OP_TIMEOUT_MS);
+	int ret = fs_unmount(&fatfs_mnt);
+	task_watchdog_note_sd_op_end();
+	if (ret < 0) {
+		sd_state = STORAGE_SD_STATE_ERROR;
+		LOG_ERR("SD unmount failed: reason=%s ret=%d; keeping mount state and power",
+			reason != NULL ? reason : "unknown", ret);
+		return ret;
+	}
+
+	sd_fs_mounted = false;
+	storage_clear_sd_state();
+	sd_state = STORAGE_SD_STATE_OFF;
+	LOG_INF("SD unmounted: %s", reason != NULL ? reason : "unknown");
+	return 0;
+}
+
+/*
+ * Last-resort detach used only when suspend preparation has exhausted its
+ * bounded retries.  The normal path must always use fs_unmount(); this helper
+ * exists to make the unified v_periph rail fail-low even when the filesystem
+ * backend refuses a normal unmount.
+ */
+static int storage_force_detach_locked(const char *reason)
+{
+	if (pcm_file_opened) {
+		task_watchdog_note_sd_op_start("sd_force_close", STORAGE_SD_CLOSE_OP_TIMEOUT_MS);
+		int close_ret = fs_close(&pcm_file);
+		task_watchdog_note_sd_op_end();
+		pcm_file_opened = false;
+		if (close_ret < 0) {
+			LOG_WRN("SD forced close failed: %d", close_ret);
+		}
+	}
+
+	if (!sd_fs_mounted && !app_state.sd_mounted) {
+		storage_clear_sd_state();
+		sd_state = STORAGE_SD_STATE_OFF;
+		return 0;
+	}
+
+	int unmount_ret = storage_sd_unmount_locked(reason);
+	if (unmount_ret == 0) {
+		return 0;
+	}
+
+	/*
+	 * A valid mount that still refuses fs_unmount() cannot be left powered
+	 * forever on this board because v_periph is shared by all peripherals.
+	 * Detach FatFS and force the disk reference count to zero before power-off.
+	 * The current PCM file has already been closed best-effort above.
+	 */
+	FRESULT fres = f_mount(NULL, STORAGE_SD_FAT_DRIVE, 0);
+	bool force = true;
+	int deinit_ret = disk_access_ioctl(STORAGE_SD_DISK_NAME,
+					     DISK_IOCTL_CTRL_DEINIT,
+					     &force);
+
+	sd_fs_mounted = false;
+	storage_clear_sd_state();
+	sd_state = STORAGE_SD_STATE_OFF;
+	LOG_ERR("SD forced detach before shared-rail power-off: reason=%s "
+		"unmount=%d fat_unreg=%u force_deinit=%d",
+		reason != NULL ? reason : "unknown",
+		unmount_ret, (unsigned int)fres, deinit_ret);
+
+	return deinit_ret < 0 ? deinit_ret : 0;
+}
+
+static int storage_cleanup_failed_mount_locked(int mount_ret)
+{
+	if (mount_ret == -EBUSY) {
+		LOG_ERR("SD mount returned -EBUSY; refusing forced cleanup because a mount may still be linked");
+		sd_state = STORAGE_SD_STATE_ERROR;
+		return mount_ret;
+	}
+
+	if (pcm_file_opened || sd_fs_mounted || app_state.sd_mounted) {
+		LOG_ERR("SD failed-mount cleanup refused: pcm_open=%u fs_mounted=%u app_mounted=%u",
+			(unsigned int)(pcm_file_opened ? 1U : 0U),
+			(unsigned int)(sd_fs_mounted ? 1U : 0U),
+			(unsigned int)(app_state.sd_mounted ? 1U : 0U));
+		sd_state = STORAGE_SD_STATE_ERROR;
+		return -EBUSY;
+	}
+
+	/* fs_mount() can fail after FatFS registered the volume and initialized the
+	 * disk. Zephyr will not accept fs_unmount() for that failed mount, so first
+	 * unregister the FatFS object directly, then force the private SD disk back
+	 * to a zero-reference, uninitialized state.
+	 */
+	FRESULT fres = f_mount(NULL, STORAGE_SD_FAT_DRIVE, 0);
+	bool force = true;
+	int deinit_ret = disk_access_ioctl(STORAGE_SD_DISK_NAME,
+					     DISK_IOCTL_CTRL_DEINIT,
+					     &force);
+
+	sd_fs_mounted = false;
+	storage_clear_sd_state();
+	sd_state = STORAGE_SD_STATE_ERROR;
+	LOG_WRN("SD failed-mount cleanup: mount_ret=%d fat_unreg=%u force_deinit=%d",
+		mount_ret, (unsigned int)fres, deinit_ret);
+	return deinit_ret;
+}
+
 static void storage_note_sd_io_lost(int io_ret)
 {
-	ARG_UNUSED(io_ret);
-	if (!app_state.sd_mounted) {
+	if (!sd_fs_mounted && !app_state.sd_mounted) {
 		return;
 	}
 
@@ -420,16 +566,18 @@ static void storage_note_sd_io_lost(int io_ret)
 	/* Close any open PCM file handle before unmounting. */
 	if (pcm_file_opened) {
 		task_watchdog_note_sd_op_start("sd_recover_close", STORAGE_SD_RECOVER_OP_TIMEOUT_MS);
-		(void)fs_close(&pcm_file);
+		int close_ret = fs_close(&pcm_file);
 		task_watchdog_note_sd_op_end();
 		pcm_file_opened = false;
+		if (close_ret < 0) {
+			LOG_WRN("SD recovery close failed: %d", close_ret);
+		}
 	}
-	task_watchdog_note_sd_op_start("sd_recover_unmount", STORAGE_SD_RECOVER_OP_TIMEOUT_MS);
-	(void)fs_unmount(&fatfs_mnt);
-	task_watchdog_note_sd_op_end();
-	storage_clear_sd_state();
+	int unmount_ret = storage_sd_unmount_locked("sd_io_lost");
 	app_state.sdon = APP_SDON_NO_RECENT_WRITE;
-	storage_sd_fuse_note_failure("sd_io_lost");
+	if (unmount_ret == 0) {
+		storage_sd_fuse_note_failure("sd_io_lost");
+	}
 }
 
 static void storage_note_sd_no_space(uint64_t free_bytes, const char *reason)
@@ -446,20 +594,18 @@ static void storage_note_sd_no_space(uint64_t free_bytes, const char *reason)
 
 	if (pcm_file_opened) {
 		task_watchdog_note_sd_op_start("sd_no_space_close", STORAGE_SD_CLOSE_OP_TIMEOUT_MS);
-		(void)fs_close(&pcm_file);
+		int close_ret = fs_close(&pcm_file);
 		task_watchdog_note_sd_op_end();
 		pcm_file_opened = false;
+		if (close_ret < 0 && first_report) {
+			LOG_WRN("SD close after no-space failed: %d", close_ret);
+		}
 	}
 
-	task_watchdog_note_sd_op_start("sd_no_space_unmount", STORAGE_SD_UNMOUNT_OP_TIMEOUT_MS);
-	int ret = fs_unmount(&fatfs_mnt);
-	task_watchdog_note_sd_op_end();
+	int ret = storage_sd_unmount_locked("no_space");
 	if (ret < 0 && first_report) {
 		LOG_WRN("SD unmount after no-space failed: %d", ret);
 	}
-
-	app_state.sd_mounted = false;
-	app_state.sd_listed_once = false;
 }
 
 static bool storage_probe_sd_capacity(uint32_t *total_mib, uint32_t *free_mib,
@@ -595,7 +741,6 @@ static struct k_work_delayable sd_mount_work;
 static struct k_work_sync sd_mount_cancel_sync;
 static int sd_mount_retry_count = 0;
 static bool sd_mount_work_inited = false;
-#define SD_MOUNT_MAX_RETRIES 5
 
 static void sd_mount_worker(struct k_work *work);
 
@@ -611,35 +756,55 @@ static void task_sd_mount_async_init_once(void)
 
 static void sd_mount_worker(struct k_work *work)
 {
+	ARG_UNUSED(work);
+
 	if (atomic_get(&storage_sleep_preparing) || app_state.sd_mounted ||
-	    atomic_get(&storage_local_write_blocked)) {
+	    atomic_get(&storage_local_write_blocked) ||
+	    task_storage_sd_fuse_active()) {
 		return;
 	}
 
-	if (sd_mount_retry_count >= SD_MOUNT_MAX_RETRIES) {
-		LOG_WRN("Background SD mount failed after %d attempts, giving up for this ACTIVE period", SD_MOUNT_MAX_RETRIES);
+	if (sd_mount_retry_count >= CONFIG_APP_SD_MOUNT_MAX_ATTEMPTS) {
+		LOG_WRN("Background SD mount failed after %d attempts, giving up for this ACTIVE period",
+			CONFIG_APP_SD_MOUNT_MAX_ATTEMPTS);
 		return;
 	}
 
 	sd_mount_retry_count++;
-	LOG_INF("Background SD mount attempt %d/%d...", sd_mount_retry_count, SD_MOUNT_MAX_RETRIES);
-	task_sd_mount();
+	LOG_INF("Background SD mount attempt %d/%d...",
+		 sd_mount_retry_count, CONFIG_APP_SD_MOUNT_MAX_ATTEMPTS);
+	int ret = task_sd_mount();
 
 	if (!atomic_get(&storage_sleep_preparing) &&
 	    !atomic_get(&storage_local_write_blocked) &&
-	    !app_state.sd_mounted && (sd_mount_retry_count < SD_MOUNT_MAX_RETRIES)) {
-		/* 挂载失败，1秒后重试 */
-		k_work_reschedule(&sd_mount_work, K_MSEC(1000));
+	    !app_state.sd_mounted &&
+	    !task_storage_sd_fuse_active() &&
+	    (sd_mount_retry_count < CONFIG_APP_SD_MOUNT_MAX_ATTEMPTS)) {
+		uint32_t delay_ms = CONFIG_APP_SD_MOUNT_RETRY_BASE_MS;
+		if (sd_mount_retry_count > 1) {
+			delay_ms <<= (sd_mount_retry_count - 1);
+		}
+		if (delay_ms > CONFIG_APP_SD_MOUNT_RETRY_MAX_MS) {
+			delay_ms = CONFIG_APP_SD_MOUNT_RETRY_MAX_MS;
+		}
+		LOG_WRN("SD mount retry scheduled in %u ms (ret=%d)",
+			(unsigned int)delay_ms, ret);
+		k_work_reschedule(&sd_mount_work, K_MSEC(delay_ms));
 	}
 }
 
-void task_sd_mount_async(void)
+void task_sd_mount_async_after(uint32_t delay_ms)
 {
 	task_sd_mount_async_init_once();
 	atomic_set(&storage_sleep_preparing, 0);
 	atomic_set(&storage_local_write_blocked, 0);
-	sd_mount_retry_count = 0; // 每个 ACTIVE 周期重置计数器
-	k_work_reschedule(&sd_mount_work, K_NO_WAIT);
+	sd_mount_retry_count = 0;
+	k_work_reschedule(&sd_mount_work, K_MSEC(delay_ms));
+}
+
+void task_sd_mount_async(void)
+{
+	task_sd_mount_async_after(0U);
 }
 
 void task_sd_mount_async_cancel(void)
@@ -653,93 +818,96 @@ void task_sd_mount_async_cancel(void)
 	sd_mount_retry_count = 0;
 }
 
-void task_sd_mount(void)
+static int storage_sd_mount_once_locked(void)
+{
+	if (sd_fs_mounted || app_state.sd_mounted) {
+		return 0;
+	}
+
+	if (atomic_get(&storage_sleep_preparing)) {
+		return -ECANCELED;
+	}
+
+	sd_state = STORAGE_SD_STATE_MOUNTING;
+	task_watchdog_note_sd_op_start("sd_mount", STORAGE_SD_MOUNT_OP_TIMEOUT_MS);
+	int ret = fs_mount(&fatfs_mnt);
+	task_watchdog_note_sd_op_end();
+	if (ret != 0) {
+		LOG_WRN("SD fs_mount failed: %d", ret);
+		(void)storage_cleanup_failed_mount_locked(ret);
+		return ret;
+	}
+
+	/* From this point fs_unmount() is valid and owns the normal DEINIT. */
+	sd_fs_mounted = true;
+	sd_state = STORAGE_SD_STATE_MOUNTED;
+
+	uint32_t total_mib = 0U;
+	uint32_t free_mib = 0U;
+	uint8_t usage_percent = 0U;
+	uint64_t free_bytes = 0U;
+	if (!storage_get_sd_capacity_with_free_bytes(&total_mib, &free_mib,
+							    &usage_percent, &free_bytes)) {
+		LOG_ERR("SD capacity probe failed after successful mount");
+		ret = storage_sd_unmount_locked("mount_capacity_probe_failed");
+		if (ret == 0) {
+			return -EIO;
+		}
+		return ret;
+	}
+
+	app_state.sd_capacity_valid = true;
+	app_state.sd_total_mib = total_mib;
+	app_state.sd_free_mib = free_mib;
+	app_state.sd_usage_percent = usage_percent;
+	LOG_INF("SD Capacity: Total=%u MiB, Free=%u MiB, Usage=%u%%, FreeBytes=%llu",
+		 total_mib, free_mib, usage_percent, free_bytes);
+
+	if (free_bytes < storage_pcm_min_free_bytes) {
+		storage_note_sd_no_space(free_bytes, "mount_capacity_check");
+		return -ENOSPC;
+	}
+
+	app_state.sd_mounted = true;
+	app_state.sd_listed_once = false;
+	storage_sd_fuse_note_success("sd_mount");
+	LOG_INF("SD card mounted at %s", fatfs_mnt.mnt_point);
+	return 0;
+}
+
+int task_sd_mount(void)
 {
 	if (atomic_get(&storage_sleep_preparing) ||
-	    atomic_get(&storage_local_write_blocked)) {
-		return;
+	    atomic_get(&storage_local_write_blocked) ||
+	    task_storage_sd_fuse_active()) {
+		return -EAGAIN;
 	}
 
-	/* First execution: Initialize SD controller */
+	/* The device readiness check is static; disk/FatFS initialization is not.
+	 * It must be repeated by fs_mount after every successful power cycle. */
 	if (!sd_initialized) {
-		if (init_sd_controller() == 0) {
-			sd_initialized = true;
-			LOG_INF("TASK-5/6/7 (Storage) initialized");
-		} else {
+		if (init_sd_controller() != 0) {
 			LOG_ERR("TASK-5/6/7 initialization failed");
-			return;
+			return -ENODEV;
 		}
+		sd_initialized = true;
+		LOG_INF("TASK-5/6/7 (Storage) initialized");
 	}
 
-	/* Already mounted - idempotent operation */
-	if (app_state.sd_mounted) {
-		return;
+	k_mutex_lock(&storage_fs_lock, K_FOREVER);
+	int ret = storage_sd_mount_once_locked();
+	k_mutex_unlock(&storage_fs_lock);
+
+	if (ret < 0 && ret != -ENOSPC && ret != -ECANCELED) {
+		storage_sd_fuse_note_failure("sd_mount_failed");
 	}
-
-
-	/* Retry mounting up to 2 times */
-	int ret = -EIO;
-	for (int attempt = 1; attempt <= 2; attempt++) {
-		if (atomic_get(&storage_sleep_preparing)) {
-			LOG_INF("SD mount aborted: sleep preparation started");
-			return;
-		}
-
-		LOG_INF("SD mount attempt %d/2...", attempt);
-		task_watchdog_feed();
-
-		/* Add delay before each attempt to let SD card stabilize */
-		if (attempt > 1) {
-			task_watchdog_feed();
-			k_msleep(500);
-		}
-
-		task_watchdog_note_sd_op_start("sd_mount", STORAGE_SD_MOUNT_OP_TIMEOUT_MS);
-		ret = fs_mount(&fatfs_mnt);
-		task_watchdog_note_sd_op_end();
-		if (ret == 0) {
-			uint32_t total_mib = 0U;
-			uint32_t free_mib = 0U;
-			uint8_t usage_percent = 0U;
-			uint64_t free_bytes = 0U;
-			if (storage_get_sd_capacity_with_free_bytes(&total_mib, &free_mib, &usage_percent, &free_bytes)) {
-				app_state.sd_capacity_valid = true;
-				app_state.sd_total_mib = total_mib;
-				app_state.sd_free_mib = free_mib;
-				app_state.sd_usage_percent = usage_percent;
-				LOG_INF("SD Capacity: Total=%u MiB, Free=%u MiB, Usage=%u%%, FreeBytes=%llu",
-				        total_mib, free_mib, usage_percent, free_bytes);
-				if (free_bytes < storage_pcm_min_free_bytes) {
-					storage_note_sd_no_space(free_bytes, "mount_capacity_check");
-					return;
-				}
-			}
-			else {
-				LOG_WRN("Failed to get SD capacity after mount");
-			}
-			app_state.sd_mounted = true;
-			app_state.sd_listed_once = false;
-			storage_sd_fuse_note_success("sd_mount");
-			LOG_INF("SD card mounted at %s (attempt %d)",
-				fatfs_mnt.mnt_point, attempt);
-			return;
-		}
-
-		if (atomic_get(&storage_sleep_preparing)) {
-			LOG_INF("SD mount stopped before sleep after attempt %d (ret=%d)", attempt, ret);
-			return;
-		}
-
-		LOG_WRN("SD mount attempt %d failed: %d", attempt, ret);
-	}
-
-	LOG_ERR("SD mount failed after 2 attempts (last error: %d)", ret);
-	storage_sd_fuse_note_failure("sd_mount_failed");
+	return ret;
 }
 
 void task_sd_ensure_mounted(void)
 {
-	if (atomic_get(&storage_local_write_blocked)) {
+	if (atomic_get(&storage_local_write_blocked) ||
+	    task_storage_sd_fuse_active()) {
 		return;
 	}
 
@@ -749,29 +917,33 @@ void task_sd_ensure_mounted(void)
 	}
 
 	/* If flag says mounted, do a lightweight probe to confirm the mount still works. */
-	if (app_state.sd_mounted) {
+	if (app_state.sd_mounted || sd_fs_mounted) {
 		uint32_t total_mib = 0U;
 		uint32_t free_mib = 0U;
 		uint8_t usage = 0U;
 		FRESULT fres = FR_INVALID_OBJECT;
-		if (!storage_probe_sd_capacity(&total_mib, &free_mib, &usage, NULL, &fres)) {
+		k_mutex_lock(&storage_fs_lock, K_FOREVER);
+		bool probe_ok = storage_probe_sd_capacity(&total_mib, &free_mib,
+								  &usage, NULL, &fres);
+		if (!probe_ok) {
 			LOG_WRN("SD probe failed (fres=%u); will remount", (unsigned int)fres);
-			storage_sd_fuse_note_failure("sd_probe_failed");
-			task_watchdog_note_sd_op_start("sd_probe_unmount", STORAGE_SD_UNMOUNT_OP_TIMEOUT_MS);
-			(void)fs_unmount(&fatfs_mnt);
-			task_watchdog_note_sd_op_end();
-			storage_clear_sd_state();
+			int unmount_ret = storage_sd_unmount_locked("sd_probe_failed");
+			k_mutex_unlock(&storage_fs_lock);
+			if (unmount_ret == 0) {
+				storage_sd_fuse_note_failure("sd_probe_failed");
+			}
 		} else {
 			/* Keep usage telemetry reasonably fresh for uplink. */
 			app_state.sd_capacity_valid = true;
 			app_state.sd_total_mib = total_mib;
 			app_state.sd_free_mib = free_mib;
 			app_state.sd_usage_percent = usage;
+			k_mutex_unlock(&storage_fs_lock);
 			return;
 		}
 	}
 
-	task_sd_mount();
+	(void)task_sd_mount();
 }
 
 void task_sd_check_capacity(void)
@@ -799,12 +971,15 @@ void task_sd_check_capacity(void)
 	uint32_t free_mib = 0U;
 	uint8_t usage = 0U;
 	FRESULT fres = FR_INVALID_OBJECT;
+	k_mutex_lock(&storage_fs_lock, K_FOREVER);
 	if (!storage_probe_sd_capacity(&total_mib, &free_mib, &usage, NULL, &fres)) {
 		LOG_WRN("Failed to read SD capacity (fres=%u)", (unsigned int)fres);
 		app_state.sd_capacity_valid = false;
-		storage_sd_fuse_note_failure("sd_capacity_failed");
-		/* If mount is broken, drop the mounted flag so next window can remount. */
-		storage_clear_sd_state();
+		int unmount_ret = storage_sd_unmount_locked("sd_capacity_failed");
+		k_mutex_unlock(&storage_fs_lock);
+		if (unmount_ret == 0) {
+			storage_sd_fuse_note_failure("sd_capacity_failed");
+		}
 		return;
 	}
 
@@ -816,6 +991,7 @@ void task_sd_check_capacity(void)
 		(unsigned int)free_mib,
 		(unsigned int)total_mib,
 		(unsigned int)usage);
+	k_mutex_unlock(&storage_fs_lock);
 }
 
 static bool storage_get_rtc_time(struct rtc_time *tm)
@@ -1520,12 +1696,16 @@ task_storage_status_t task_storage_pcm_begin(char *out_path, size_t out_sz)
 
 	uint8_t usage = 0U;
 	uint64_t free_bytes = 0U;
-	if (!storage_get_sd_capacity_with_free_bytes(&app_state.sd_total_mib,
-						     &app_state.sd_free_mib,
-						     &usage,
-						     &free_bytes)) {
+	FRESULT capacity_fres = FR_INVALID_OBJECT;
+	if (!storage_probe_sd_capacity(&app_state.sd_total_mib,
+					       &app_state.sd_free_mib,
+					       &usage,
+					       &free_bytes,
+					       &capacity_fres)) {
 		app_state.sd_capacity_valid = false;
-		storage_sd_fuse_note_failure("sd_pcm_capacity_failed");
+		LOG_WRN("SD PCM capacity probe failed (fres=%u); recovering mount",
+			(unsigned int)capacity_fres);
+		storage_note_sd_io_lost(-EIO);
 		status = TASK_STORAGE_STATUS_CAPACITY_UNAVAILABLE;
 		goto out;
 	}
@@ -1562,13 +1742,20 @@ task_storage_status_t task_storage_pcm_begin(char *out_path, size_t out_sz)
 	int mkdir_ret = storage_ensure_audio_parent_dirs(&tm);
 	task_watchdog_note_sd_op_end();
 	if (mkdir_ret != 0) {
-		LOG_WRN("Failed to prepare audio directory tree for %s", out_path);
+		LOG_WRN("Failed to prepare audio directory tree for %s: %d",
+			out_path, mkdir_ret);
+		if (mkdir_ret == -ENODEV || mkdir_ret == -EIO) {
+			storage_note_sd_io_lost(mkdir_ret);
+		}
+		status = TASK_STORAGE_STATUS_IO_ERROR;
+		goto out;
 	}
 
 	task_watchdog_note_sd_op_start("sd_open_pcm", STORAGE_SD_OPEN_OP_TIMEOUT_MS);
 	int ret = fs_open(&pcm_file, out_path, FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
 	task_watchdog_note_sd_op_end();
 	if (ret != 0) {
+		LOG_WRN("Failed to open PCM file %s: %d", out_path, ret);
 		if (ret == -ENODEV || ret == -EIO) {
 			storage_note_sd_io_lost(ret);
 		}
@@ -1864,9 +2051,6 @@ int task_storage_prepare_sleep(void)
 {
 	atomic_set(&storage_sleep_preparing, 1);
 	task_sd_mount_async_cancel();
-	if (task_storage_sd_fuse_active()) {
-		return 0;
-	}
 	task_storage_pcm_end();
 	if (atomic_get(&storage_pcm_close_pending)) {
 		LOG_WRN("SD prepare sleep: PCM close still pending, keep v_periph on");
@@ -1880,23 +2064,48 @@ int task_storage_prepare_sleep(void)
 		return -EBUSY;
 	}
 
-	if (!app_state.sd_mounted) {
+	if (!sd_fs_mounted && !app_state.sd_mounted) {
 		k_mutex_unlock(&storage_fs_lock);
 		return 0;
 	}
 
-	task_watchdog_note_sd_op_start("sd_unmount", STORAGE_SD_UNMOUNT_OP_TIMEOUT_MS);
-	int ret = fs_unmount(&fatfs_mnt);
-	task_watchdog_note_sd_op_end();
+	int ret = storage_sd_unmount_locked("prepare_sleep");
 	if (ret < 0) {
 		LOG_WRN("SD unmount before sleep failed: %d", ret);
 		k_mutex_unlock(&storage_fs_lock);
 		return ret;
-	} else {
-		LOG_INF("SD unmounted before sleep");
 	}
 
-	storage_clear_sd_state();
 	k_mutex_unlock(&storage_fs_lock);
 	return 0;
+}
+
+int task_storage_force_poweroff_cleanup(void)
+{
+	/* No new mount or file operation may start once the shared rail is being
+	 * forced off.  The flags are cleared on the next ACTIVE mount schedule. */
+	atomic_set(&storage_sleep_preparing, 1);
+	atomic_set(&storage_local_write_blocked, 1);
+	task_sd_mount_async_cancel();
+	task_storage_pcm_end();
+
+	int lock_ret = k_mutex_lock(&storage_fs_lock,
+				    K_MSEC(STORAGE_SD_UNMOUNT_LOCK_WAIT_MS));
+	int cleanup_ret;
+	if (lock_ret == 0) {
+		cleanup_ret = storage_force_detach_locked("suspend_retry_exhausted");
+		k_mutex_unlock(&storage_fs_lock);
+	} else {
+		/* The board must still power the shared peripheral rail down.  Clear
+		 * software ownership so the next cold power-up performs a real mount. */
+		LOG_ERR("SD force-poweroff cleanup could not acquire FS lock after %u ms",
+			(unsigned int)STORAGE_SD_UNMOUNT_LOCK_WAIT_MS);
+		sd_fs_mounted = false;
+		storage_clear_sd_state();
+		sd_state = STORAGE_SD_STATE_OFF;
+		cleanup_ret = lock_ret;
+	}
+
+	storage_sd_fuse_note_failure("forced_poweroff");
+	return cleanup_ret;
 }

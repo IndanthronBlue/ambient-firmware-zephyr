@@ -314,7 +314,15 @@ int main(void)
 	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED) {
 		LOG_INF("[BOOT] microphone debug mode: skip startup LoRaWAN connect");
 	} else {
-		int startup_lora_ret = task_lorawan_connect();
+		bool force_fresh_join = reset_cause_valid &&
+			((reset_cause & RESET_PIN) != 0U);
+
+		LOG_INF("[BOOT] LoRaWAN startup policy: %s",
+			force_fresh_join ?
+			"pin reset requires fresh OTAA join" :
+			"restore persisted session when available");
+
+		int startup_lora_ret = task_lorawan_connect(force_fresh_join);
 
 		if (startup_lora_ret != 0) {
 			LOG_WRN("Startup LoRaWAN connect failed; will retry during runtime");

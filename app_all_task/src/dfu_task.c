@@ -221,19 +221,11 @@ static const char *dfu_check_origin_name(enum dfu_check_origin origin)
 	}
 }
 
-static void dfu_check_and_apply_common(enum dfu_check_origin origin, bool allow_mount)
+static bool dfu_check_and_apply_locked(enum dfu_check_origin origin)
 {
 	const struct flash_area *slot1;
 	size_t update_size = 0U;
 	int ret;
-
-	if (allow_mount) {
-		task_sd_ensure_mounted();
-	} else if (!app_state.sd_mounted) {
-		LOG_DBG("DFU skipped (%s): SD card not mounted",
-			dfu_check_origin_name(origin));
-		return;
-	}
 
 	if (!app_state.sd_mounted) {
 		if (origin == DFU_CHECK_ORIGIN_BOOT) {
@@ -243,7 +235,7 @@ static void dfu_check_and_apply_common(enum dfu_check_origin origin, bool allow_
 			LOG_DBG("DFU skipped (%s): SD card not mounted",
 				dfu_check_origin_name(origin));
 		}
-		return;
+		return false;
 	}
 
 	ret = dfu_get_update_file_size(DFU_UPDATE_FILE_PATH, &update_size);
@@ -253,21 +245,21 @@ static void dfu_check_and_apply_common(enum dfu_check_origin origin, bool allow_
 		} else {
 			LOG_DBG("DFU: no %s in SD root", DFU_UPDATE_FILE_PATH);
 		}
-		return;
+		return false;
 	}
 	if (ret != 0) {
 		LOG_WRN("DFU: cannot stat update image (%d)", ret);
-		return;
+		return false;
 	}
 	if (update_size == 0U) {
 		LOG_WRN("DFU: update image is empty");
-		return;
+		return false;
 	}
 
 	ret = flash_area_open(DFU_SLOT1_AREA_ID, &slot1);
 	if (ret != 0) {
 		LOG_ERR("DFU: flash_area_open(image_1) failed: %d", ret);
-		return;
+		return false;
 	}
 
 	if (update_size > slot1->fa_size) {
@@ -275,7 +267,7 @@ static void dfu_check_and_apply_common(enum dfu_check_origin origin, bool allow_
 			(unsigned int)update_size,
 			(unsigned int)slot1->fa_size);
 		flash_area_close(slot1);
-		return;
+		return false;
 	}
 
 	flash_area_close(slot1);
@@ -286,19 +278,43 @@ static void dfu_check_and_apply_common(enum dfu_check_origin origin, bool allow_
 	ret = dfu_copy_file_to_image_1(DFU_UPDATE_FILE_PATH, update_size);
 	if (ret != 0) {
 		LOG_ERR("DFU: image write failed (%d)", ret);
-		return;
+		return false;
 	}
 
 	ret = boot_request_upgrade(BOOT_UPGRADE_PERMANENT);
 	if (ret != 0) {
 		LOG_ERR("DFU: boot_request_upgrade failed: %d", ret);
-		return;
+		return false;
 	}
 
 	dfu_mark_update_file_consumed();
-	LOG_INF("DFU: upgrade requested (PERMANENT), rebooting now");
-	LOG_PANIC();
-	sys_reboot(SYS_REBOOT_COLD);
+	return true;
+}
+
+static void dfu_check_and_apply_common(enum dfu_check_origin origin, bool allow_mount)
+{
+	if (allow_mount) {
+		task_sd_ensure_mounted();
+	} else if (!app_state.sd_mounted) {
+		LOG_DBG("DFU skipped (%s): SD card not mounted",
+			dfu_check_origin_name(origin));
+		return;
+	}
+
+	if (!app_state.sd_mounted || task_storage_fs_lock() != 0) {
+		LOG_DBG("DFU skipped (%s): SD FS unavailable or busy",
+			dfu_check_origin_name(origin));
+		return;
+	}
+
+	bool reboot = dfu_check_and_apply_locked(origin);
+	task_storage_fs_unlock();
+
+	if (reboot) {
+		LOG_INF("DFU: upgrade requested (PERMANENT), rebooting now");
+		LOG_PANIC();
+		sys_reboot(SYS_REBOOT_COLD);
+	}
 }
 
 /**

@@ -142,6 +142,62 @@ config APP_SUSPEND_TO_ACTIVE_PERIOD_MS
 	  Periodic wake interval used by the active/suspend power FSM. The default
 	  is 30 seconds.
 
+config APP_SD_POWER_SETTLE_MS
+	int "SD power-on settle delay"
+	default 500
+	range 0 10000
+	help
+	  Delay after v_periph is physically enabled before the first SD mount
+	  attempt. This is used to make cold SD power cycles reliable.
+
+config APP_SD_MOUNT_MAX_ATTEMPTS
+	int "Maximum SD mount attempts per ACTIVE period"
+	default 3
+	range 1 10
+	help
+	  Maximum number of single, fully-cleaned SD mount attempts in one ACTIVE
+	  period. A failed attempt is cleaned up before any retry.
+
+config APP_SD_MOUNT_RETRY_BASE_MS
+	int "SD mount retry base delay"
+	default 500
+	range 100 60000
+	help
+	  Base delay before retrying a failed SD mount attempt. Later retries use
+	  exponential backoff up to APP_SD_MOUNT_RETRY_MAX_MS.
+
+config APP_SD_MOUNT_RETRY_MAX_MS
+	int "SD mount retry maximum delay"
+	default 5000
+	range 100 60000
+	help
+	  Maximum delay between cleaned SD mount attempts.
+
+config APP_SD_SUSPEND_RETRY_MS
+	int "Suspend preparation retry delay"
+	default 500
+	range 100 60000
+	help
+	  Delay before retrying suspend preparation when SD unmount or another
+	  storage operation is still busy.
+
+config APP_SD_SUSPEND_RETRY_MAX
+	int "Maximum suspend preparation attempts"
+	default 3
+	range 1 20
+	help
+	  Maximum number of suspend preparation attempts, including the initial
+	  attempt, before storage is force-detached and the shared v_periph rail
+	  is powered off. This bounds the extra active time after an SD failure.
+
+config APP_SD_SUSPEND_RETRY_MAX_MS
+	int "Suspend preparation maximum retry delay"
+	default 5000
+	range 100 60000
+	help
+	  Maximum delay between bounded suspend preparation retries when storage
+	  cannot yet finish an outstanding SD operation.
+
 config APP_LORAWAN_APP_KEY_HEX
 	string "LoRaWAN OTAA AppKey in hex"
 	default ""

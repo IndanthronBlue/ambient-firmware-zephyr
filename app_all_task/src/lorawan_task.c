@@ -67,6 +67,8 @@ BUILD_ASSERT(TX_PAYLOAD_LENGTH <= UINT8_MAX,
 
 static bool lorawan_stack_started;
 static bool lorawan_session_joined;
+/* A pin reset requires a new OTAA session before any application uplink. */
+static bool fresh_join_required;
 static bool lorawan_mac_initialized;
 static bool downlink_cb_registered;
 static bool dev_eui_initialized;
@@ -127,6 +129,7 @@ static void lorawan_reset_debug_session_state(void)
 {
 	lorawan_stack_started = false;
 	lorawan_session_joined = false;
+	fresh_join_required = false;
 	app_state.lorawan_joined = false;
 	confirmed_fail_streak = 0U;
 	next_join_deadline = k_uptime_get();
@@ -513,6 +516,22 @@ static bool lorawan_restore_session_state(const char *reason)
 		have_fcnt = true;
 	}
 
+	if (fresh_join_required) {
+		/* Keep the restored Crypto context (especially DevNonce), but do not
+		 * expose the restored application session. The next OTAA Join will make
+		 * LoRaMAC reset NetworkActivation and allocate a fresh session. */
+		lorawan_session_joined = false;
+		app_state.lorawan_joined = false;
+
+		LOG_INF("LoRaWAN persisted session blocked: fresh OTAA join required (%s)",
+			reason);
+		if (have_dev_addr || have_fcnt) {
+			LOG_INF("LoRaWAN blocked session context: DevAddr=0x%08x FCntUp=%u",
+				(unsigned int)dev_addr, (unsigned int)fcnt_up);
+		}
+		return false;
+	}
+
 	lorawan_session_joined = true;
 	app_state.lorawan_joined = true;
 	confirmed_fail_streak = 0U;
@@ -527,6 +546,25 @@ static bool lorawan_restore_session_state(const char *reason)
 	}
 
 	return true;
+#endif
+}
+
+static void lorawan_log_next_dev_nonce(void)
+{
+#if IS_ENABLED(CONFIG_LORAWAN_NVM_SETTINGS)
+	MibRequestConfirm_t mib_req = { 0 };
+
+	mib_req.Type = MIB_NVM_CTXS;
+	if ((LoRaMacMibGetRequestConfirm(&mib_req) == LORAMAC_STATUS_OK) &&
+	    (mib_req.Param.Contexts != NULL)) {
+		uint16_t stored_dev_nonce = mib_req.Param.Contexts->Crypto.DevNonce;
+
+		LOG_INF("LoRaWAN stored DevNonce=%u; next OTAA JoinRequest uses %u",
+			(unsigned int)stored_dev_nonce,
+			(unsigned int)((uint16_t)(stored_dev_nonce + 1U)));
+	} else {
+		LOG_WRN("LoRaWAN stored DevNonce unavailable before OTAA join");
+	}
 #endif
 }
 
@@ -668,6 +706,7 @@ static int lorawan_attempt_join(void)
 {
 	struct lorawan_join_config join_cfg = { 0 };
 	int ret;
+	bool was_fresh_join_required = fresh_join_required;
 #if IS_ENABLED(CONFIG_LORAWAN_NVM_NONE)
 	uint16_t dev_nonce;
 #endif
@@ -704,6 +743,7 @@ static int lorawan_attempt_join(void)
 	LOG_INF("LoRaWAN join attempt #%u (dev_nonce=%u)",
 		app_state.lorawan_join_attempts, (unsigned int)dev_nonce);
 #else
+	lorawan_log_next_dev_nonce();
 	app_state.lorawan_join_attempts++;
 
 	LOG_INF("LoRaWAN join attempt #%u (DevNonce managed by LoRaWAN NVM)",
@@ -727,6 +767,10 @@ static int lorawan_attempt_join(void)
 	lorawan_session_joined = true;
 	app_state.lorawan_joined = true;
 	confirmed_fail_streak = 0U;
+	fresh_join_required = false;
+	if (was_fresh_join_required) {
+		LOG_INF("LoRaWAN fresh OTAA join requirement cleared");
+	}
 	LOG_INF("LoRaWAN session established (OTAA); session version is managed by stack/network");
 
 	return 0;
@@ -950,6 +994,14 @@ int task_lorawan_send_event_uplink(void)
 	int64_t now = k_uptime_get();
 	int ret;
 
+	/* Never let a restored session escape while a pin reset is waiting for a
+	 * fresh Join. The flag remains set across LoRa radio power cycles until a
+	 * Join succeeds. */
+	if (fresh_join_required) {
+		lorawan_session_joined = false;
+		app_state.lorawan_joined = false;
+	}
+
 	if (!lorawan_stack_started) {
 		LOG_INF("LoRaWAN stack/session not active, initializing before uplink");
 		if (now < next_join_deadline) {
@@ -1084,7 +1136,7 @@ int task_lorawan_send_boot_debug_uplink(void)
 	return 0;
 }
 
-int task_lorawan_connect(void)
+int task_lorawan_connect(bool force_fresh_join)
 {
 	if (APP_MICROPHONE_DEBUG_SKIP_GPS_LORA_ENABLED) {
 		lorawan_log_microphone_debug_skip("startup connect");
@@ -1094,6 +1146,13 @@ int task_lorawan_connect(void)
 	}
 
 	int ret;
+
+	if (force_fresh_join) {
+		fresh_join_required = true;
+		lorawan_session_joined = false;
+		app_state.lorawan_joined = false;
+		LOG_INF("LoRaWAN pin reset requests fresh OTAA join");
+	}
 
 	/*
 	 * Called from main() startup loop before any event-driven uplink.
@@ -1108,6 +1167,13 @@ int task_lorawan_connect(void)
 			return ret;
 		}
 		lorawan_stack_started = true;
+	}
+
+	if (fresh_join_required) {
+		lorawan_session_joined = false;
+		app_state.lorawan_joined = false;
+		LOG_INF("LoRaWAN startup connect: fresh OTAA join required; old session blocked");
+		return lorawan_attempt_join();
 	}
 
 	if (lorawan_session_joined) {

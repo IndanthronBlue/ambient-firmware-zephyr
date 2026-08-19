@@ -38,6 +38,9 @@ struct power_fsm_ctx {
 	const char *active_uplink_reason;
 	bool deep_sleep_prepared;
 	uint8_t codec_zero_fault_streak;
+	bool suspend_prepare_pending;
+	uint8_t suspend_prepare_retry_count;
+	uint32_t suspend_prepare_retry_deadline_ms;
 };
 
 static struct power_fsm_ctx fsm;
@@ -183,6 +186,8 @@ static void power_fsm_enter(power_state_t next, const char *reason)
 	case POWER_STATE_ACTIVE:
 		fsm.active_next_period_deadline_ms = now;
 		fsm.active_exit_deadline_ms = now + ACTIVE_BURST_MS;
+		fsm.suspend_prepare_pending = false;
+		fsm.suspend_prepare_retry_count = 0U;
 		fsm.active_uplink_pending = false;
 		fsm.active_uplink_in_progress = false;
 		fsm.active_uplink_type = TASK_COMM_UPLINK_NO_GPS;
@@ -206,16 +211,70 @@ static void power_fsm_enter(power_state_t next, const char *reason)
 				return;
 			}
 		}
-		/* 后台挂载SD卡 (非阻塞) */
-		task_sd_mount_async();
+		/* 后台挂载 SD 卡。冷上电时先等待电源和 SD 控制器稳定。 */
+		task_sd_mount_async_after(pwr_ret > 0 ?
+			CONFIG_APP_SD_POWER_SETTLE_MS : 0U);
 		break;
 	case POWER_STATE_SUSPEND:
 		task_ina3221_block_active(true);
 		if (!task_ina3221_wait_idle(1000U)) {
 			LOG_WRN("[PWR] INA read still busy while entering SUSPEND; continue suspend prep");
 		}
-		/* 卸载SD卡、关闭高耗电外设、进入常规低功耗准备（保留sound wakeup） */
-		(void)power_ctrl_prepare_suspend();
+		/* 卸载 SD 卡、关闭高耗电外设、进入常规低功耗准备（保留 sound wakeup）。 */
+		int suspend_ret = power_ctrl_prepare_suspend();
+		if (suspend_ret < 0) {
+			if (fsm.suspend_prepare_retry_count < UINT8_MAX) {
+				fsm.suspend_prepare_retry_count++;
+			}
+
+			/* v_periph is a shared peripheral rail, so a persistent SD failure
+			 * must not keep the entire board powered indefinitely.  After the
+			 * bounded attempts, detach storage best-effort and force the rail off. */
+			if (fsm.suspend_prepare_retry_count >= CONFIG_APP_SD_SUSPEND_RETRY_MAX) {
+				int cleanup_ret = task_storage_force_poweroff_cleanup();
+				task_lorawan_prepare_sleep();
+				int poweroff_ret = power_ctrl_vperiph_off();
+
+				fsm.state = POWER_STATE_SUSPEND;
+				fsm.entered_at_ms = now;
+				fsm.suspend_prepare_pending = false;
+				fsm.suspend_prepare_retry_count = 0U;
+				fsm.suspend_prepare_retry_deadline_ms = 0U;
+				fsm.suspend_to_active_deadline_ms =
+					k_uptime_get_32() + SUSPEND_TO_ACTIVE_PERIOD_MS;
+				task_ina3221_block_active(false);
+				LOG_ERR("[PWR] suspend preparation failed %u times; "
+					"forced shared-rail power-off (last=%d cleanup=%d poweroff=%d)",
+					(unsigned int)CONFIG_APP_SD_SUSPEND_RETRY_MAX,
+					suspend_ret, cleanup_ret, poweroff_ret);
+				LOG_INF("[PWR] %s->%s reason=suspend_retry_exhausted",
+					state_to_str(prev), state_to_str(POWER_STATE_SUSPEND));
+				return;
+			}
+
+			/* A transient close/lock/unmount failure gets a short retry without
+			 * starting another capture. */
+			fsm.state = prev;
+			fsm.entered_at_ms = now;
+			fsm.suspend_prepare_pending = true;
+			uint32_t retry_ms = CONFIG_APP_SD_SUSPEND_RETRY_MS;
+			if (fsm.suspend_prepare_retry_count > 1U &&
+			    fsm.suspend_prepare_retry_count < 8U) {
+				retry_ms <<= (fsm.suspend_prepare_retry_count - 1U);
+			}
+			if (retry_ms > CONFIG_APP_SD_SUSPEND_RETRY_MAX_MS) {
+				retry_ms = CONFIG_APP_SD_SUSPEND_RETRY_MAX_MS;
+			}
+			fsm.suspend_prepare_retry_deadline_ms = now + retry_ms;
+			task_ina3221_block_active(false);
+			LOG_ERR("[PWR] suspend preparation failed: %d; retry in %u ms (attempt=%u)",
+				suspend_ret,
+				(unsigned int)retry_ms,
+				(unsigned int)fsm.suspend_prepare_retry_count);
+			return;
+		}
+		fsm.suspend_prepare_pending = false;
+		fsm.suspend_prepare_retry_count = 0U;
 		fsm.suspend_to_active_deadline_ms =
 			k_uptime_get_32() + SUSPEND_TO_ACTIVE_PERIOD_MS;
 		release_ina_after_suspend_prepare = true;
@@ -349,6 +408,9 @@ int power_fsm_init(void)
 	fsm.active_uplink_reason = "init";
 	fsm.deep_sleep_prepared = false;
 	fsm.codec_zero_fault_streak = 0U;
+	fsm.suspend_prepare_pending = false;
+	fsm.suspend_prepare_retry_count = 0U;
+	fsm.suspend_prepare_retry_deadline_ms = 0U;
 	atomic_set(&wake_flags, 0);
 	atomic_set(&pm_enter_count, 0);
 	atomic_set(&pm_exit_count, 0);
@@ -421,6 +483,10 @@ k_timeout_t power_fsm_next_wait_timeout(void)
 
 	switch (fsm.state) {
 	case POWER_STATE_ACTIVE:
+		if (fsm.suspend_prepare_pending) {
+			wait_ms = ms_until(now, fsm.suspend_prepare_retry_deadline_ms);
+			break;
+		}
 		if (fsm.active_uplink_in_progress) {
 			wait_ms = ms_until(now, fsm.active_exit_deadline_ms);
 			if (wait_ms > ACTIVE_UPLINK_POLL_MS) {
@@ -576,6 +642,15 @@ static bool power_fsm_prepare_timed_uplink(uint32_t now)
 
 static void power_fsm_tick_active(uint32_t now)
 {
+	if (fsm.suspend_prepare_pending) {
+		if (!time_reached(now, fsm.suspend_prepare_retry_deadline_ms)) {
+			return;
+		}
+		fsm.suspend_prepare_pending = false;
+		power_fsm_enter(POWER_STATE_SUSPEND, "suspend_prepare_retry");
+		return;
+	}
+
 	if (fsm.active_uplink_in_progress) {
 		if (!task_comm_is_pending_or_busy()) {
 			LOG_INF("[PWR] deferred comm uplink complete, entering suspend");

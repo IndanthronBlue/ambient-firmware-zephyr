@@ -290,6 +290,7 @@ static void mic_sd_consumer_thread(void *a, void *b, void *c)
 	static int16_t mic_sd_chunk_buf[MIC_SD_BLOCKS_PER_CHUNK * MIC_APP_SAMPLES_PER_BLOCK];
 	uint32_t chunk_fill_blocks = 0U;
 	bool pcm_file_initialized = false;
+	bool pcm_begin_failed_for_session = false;
 	char path[64] = {0};
 
 	while (1) {
@@ -324,8 +325,15 @@ static void mic_sd_consumer_thread(void *a, void *b, void *c)
 					if (chunk_fill_blocks > 0U && pcm_file_initialized) {
 						size_t bytes = (size_t)chunk_fill_blocks * MIC_APP_BLOCK_SIZE;
 						atomic_inc(&sd_write_inflight);
-						(void)task_storage_pcm_write(mic_sd_chunk_buf, bytes);
+						task_storage_status_t tail_status =
+							task_storage_pcm_write(mic_sd_chunk_buf, bytes);
 						atomic_dec(&sd_write_inflight);
+						if (tail_status != TASK_STORAGE_STATUS_OK) {
+							LOG_WRN("SD catch-up: final PCM write failed (%d)",
+								(int)tail_status);
+							pcm_file_initialized = false;
+							task_storage_pcm_end_from_worker();
+						}
 					}
 					chunk_fill_blocks = 0U;
 					atomic_set(&sd_chunk_pending_blocks, 0);
@@ -333,9 +341,11 @@ static void mic_sd_consumer_thread(void *a, void *b, void *c)
 						task_storage_pcm_end_from_worker();
 					}
 					pcm_file_initialized = false;
+					pcm_begin_failed_for_session = false;
 					break;
 				}
 				if (!active) {
+					pcm_begin_failed_for_session = false;
 					break;
 				}
 				break;
@@ -351,6 +361,16 @@ static void mic_sd_consumer_thread(void *a, void *b, void *c)
 
 				/* 如果文件还没打开，说明是该次录音的第一块，先等待挂载并 Begin */
 				if (!pcm_file_initialized) {
+					/* A failed begin is terminal for this capture session.  Do not
+					 * retry every chunk (or every worker wakeup), because repeated
+					 * begin/capacity/mount attempts can keep the SD stack alive and
+					 * amplify a transient card failure. */
+					if (pcm_begin_failed_for_session) {
+						chunk_fill_blocks = 0U;
+						atomic_set(&sd_chunk_pending_blocks, 0);
+						continue;
+					}
+
 					while (atomic_get(&mic_pipeline_active) &&
 					       !app_state.sd_mounted &&
 					       !task_storage_local_write_blocked()) {
@@ -371,6 +391,7 @@ static void mic_sd_consumer_thread(void *a, void *b, void *c)
 							pcm_file_initialized = true;
 							LOG_INF("SD catch-up: background file opened at %s", path);
 						} else {
+							pcm_begin_failed_for_session = true;
 							if (storage_status != TASK_STORAGE_STATUS_NO_SPACE) {
 								LOG_WRN("SD catch-up: pcm_begin failed (%d), dropping blocks",
 									(int)storage_status);
@@ -395,6 +416,9 @@ static void mic_sd_consumer_thread(void *a, void *b, void *c)
 				chunk_fill_blocks = 0U;
 				atomic_set(&sd_chunk_pending_blocks, 0);
 				if (st != TASK_STORAGE_STATUS_OK) {
+					pcm_file_initialized = false;
+					pcm_begin_failed_for_session = true;
+					task_storage_pcm_end_from_worker();
 					k_mutex_lock(&mic_ring_lock, K_FOREVER);
 					mic_ring_sd_fail_count++;
 					k_mutex_unlock(&mic_ring_lock);

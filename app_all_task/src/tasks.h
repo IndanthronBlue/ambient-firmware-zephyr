@@ -203,8 +203,9 @@ void task_ina3221_block_active(bool block);
 bool task_ina3221_wait_idle(uint32_t timeout_ms);
 
 
-void task_sd_mount(void);
+int task_sd_mount(void);
 void task_sd_mount_async(void);
+void task_sd_mount_async_after(uint32_t delay_ms);
 void task_sd_ensure_mounted(void);
 void task_sd_check_capacity(void);
 typedef enum {
@@ -223,6 +224,8 @@ void task_storage_pcm_end_from_worker(void);
 void task_storage_sd_fuse_init(void);
 bool task_storage_sd_fuse_active(void);
 bool task_storage_local_write_blocked(void);
+int task_storage_fs_lock(void);
+void task_storage_fs_unlock(void);
 task_storage_status_t task_storage_persist_dev_eui(const uint8_t dev_eui[8]);
 bool task_storage_load_dev_eui(uint8_t dev_eui[8]);
 int task_storage_reserve_lorawan_dev_nonce(uint16_t seed, uint16_t *dev_nonce);
@@ -236,7 +239,7 @@ void task_dfu_check_and_apply(void);
 void task_dfu_check_and_apply_periodic(void);
 
 
-int task_lorawan_connect(void);
+int task_lorawan_connect(bool force_fresh_join);
 int task_lorawan_send_boot_debug_uplink(void);
 int task_lorawan_send_event_uplink(void);
 bool task_lorawan_drop_uplink_if_backoff(void);
@@ -301,6 +304,7 @@ int task_rtc_prepare_shutdown_wakeup_route(void);
 
 /* ========== Low-power preparation hooks ========== */
 int task_storage_prepare_sleep(void);
+int task_storage_force_poweroff_cleanup(void);
 void task_sd_mount_async(void);
 void task_sd_mount_async_cancel(void);
 void task_gps_prepare_sleep(void);
